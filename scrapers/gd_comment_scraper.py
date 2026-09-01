@@ -236,9 +236,6 @@ def fetch_comments(identifier: str) -> tuple[list[dict], dict]:
 
     try:
         data = resp.json()
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"    JSON decode error for {identifier}: {e}")
-        return [], {}
 
         reviews = data.get("reviews", [])
 
@@ -285,7 +282,7 @@ def fetch_comments(identifier: str) -> tuple[list[dict], dict]:
         # Map song positions to track durations (after both setlist and files are parsed)
         # The order of songs in the setlist corresponds to the order of audio tracks
         setlist = map_durations_to_songs(setlist)
-
+        
         if reviews:
             logger.info(f"    Found {len(reviews)} comments")
             if setlist.get('songs'):
@@ -298,9 +295,8 @@ def fetch_comments(identifier: str) -> tuple[list[dict], dict]:
             logger.info(f"    No comments for this item")
 
         return reviews, setlist
-
-    except json.JSONDecodeError:
-        logger.warning(f"    Invalid JSON for {identifier}")
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(f"    Invalid JSON for {identifier}: {e}")
         return [], {}
     except Exception as e:
         logger.error(f"    Error: {e}")
@@ -609,10 +605,10 @@ def main():
     while processed_count < args.target and state["current_year"] <= 1995:
         year = state["current_year"]
         identifiers = search_shows_paginated(year, processed_ids_set, args.target - processed_count)
-        state["current_year"] += 1
-
+        
         if not identifiers:
-            logger.info(f"No shows for {year}, moving to {year + 1}")
+            logger.info(f"No shows for {year}, advancing to {year + 1}")
+            state["current_year"] += 1
             continue
 
         if args.dry_run:
@@ -636,7 +632,11 @@ def main():
             processed_count += 1
             logger.info(f"\n[Run attempt {processed_count}/{args.target}] {identifier}")
 
-            raw_reviews, setlist = fetch_comments(identifier)
+            result = fetch_comments(identifier)
+            if result is None:
+                logger.error(f"    fetch_comments returned None for {identifier}, skipping")
+                continue
+            raw_reviews, setlist = result
             if raw_reviews:
                 state["shows_with_comments"] += 1
                 for review in raw_reviews:
