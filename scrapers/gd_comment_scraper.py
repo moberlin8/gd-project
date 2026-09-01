@@ -91,6 +91,7 @@ def load_state() -> dict:
     return {
         "processed_ids": [],
         "current_year": 1965,
+        "fully_scanned_years": [],
         "shows_with_comments": 0,
         "total_comments": 0,
         "total_setlists": 0,
@@ -152,7 +153,7 @@ def search_shows_paginated(year: int, processed_ids: set, target_count: int) -> 
     all_identifiers = []
     start = 0
     rows_per_page = 100
-    max_pages = 50  # safety limit
+    max_pages = 200  # 200 pages × 100 = 20,000 max results (covers even busiest years)
 
     for page_num in range(max_pages):
         params = {
@@ -587,7 +588,7 @@ def main():
 
     # Convert processed_ids to a set for fast lookup, but keep the list for state saving
     processed_ids_set = set(state["processed_ids"])
-
+    fully_scanned_years = set(state.get("fully_scanned_years", []))
     # Graceful shutdown handler — saves state on SIGTERM/SIGINT
     shutdown_requested = False
 
@@ -602,12 +603,30 @@ def main():
     signal.signal(signal.SIGINT, handle_signal)
 
     # Iterate through years until target reached
-    while processed_count < args.target and state["current_year"] <= 1995:
+    # Wraps around from 1995 back to 1965 to prefer earlier shows
+    while processed_count < args.target:
         year = state["current_year"]
+        
+        # Wrap around: when we've gone past 1995, start over at 1965
+        if year > 1995:
+            state["current_year"] = 1965
+            fully_scanned_years.clear()
+            state["fully_scanned_years"] = []
+            logger.info(f"=== Wrapped around to 1965 (new pass) ===")
+            continue
+        
+        # Skip years already fully scanned in this pass
+        if year in fully_scanned_years:
+            logger.info(f"Year {year} already fully scanned, advancing to {year + 1}")
+            state["current_year"] += 1
+            continue
+        
         identifiers = search_shows_paginated(year, processed_ids_set, args.target - processed_count)
         
         if not identifiers:
             logger.info(f"No shows for {year}, advancing to {year + 1}")
+            fully_scanned_years.add(year)
+            state["fully_scanned_years"] = list(fully_scanned_years)
             state["current_year"] += 1
             continue
 
