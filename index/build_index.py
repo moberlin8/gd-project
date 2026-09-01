@@ -16,6 +16,7 @@ Output:
 import gc
 import json
 import os
+import re
 import sys
 
 import faiss
@@ -56,41 +57,121 @@ def normalize_setlist(show_id: str, sl) -> dict:
         'raw_description': ''
     }
 
-    current_set = {'name': 'Set I', 'order': 0, 'songs': []}
-    result['sets'].append(current_set)
+    current_set = None  # Lazily created when we encounter the first song entry
+
+    # Known GD song titles, sorted by length (longest first) for matching
+    GD_SONGS = [
+        'turn on your lovelight', 'estimated prophet', 'scarlet begonias',
+        'sugar magnolia', 'morning dew', 'casey jones', 'mama tried',
+        'high time', 'easy wind', 'yellow dog story', 'dark star',
+        'saint stephen', 'the eleven', 'truckin', 'good lovin',
+        'playing in the band', 'wharf rat', 'me and my uncle',
+        'friend of the devil', 'big railroad', 'cumberland gorge',
+        'me and bobby magee', 'row jimmy', 'brokedown servants',
+        'greatest story ever', 'terrapin station', 'the other one',
+        'stella blue', 'help on the way', 'slipknot', 'franklin tower',
+        'promised land', 'black peter', 'one more saturday night',
+        'lost sailor', 'st of cdc', 'china cat sunflower',
+        'i know you rider', 'around here', 'space', 'drumz',
+        'one more saturday', 'sugar', 'bertha', 'sunshine',
+        'eyes', 'wheel', 'dark star',
+    ]
+
+    def _split_songs(text: str) -> list:
+        """Split a song-list string into individual song names using known titles as anchors."""
+        text_lower = text.lower().strip()
+        if not text_lower:
+            return []
+        # Sort by length so longest titles match first (avoids "Sugar" matching inside "Sugar Magnolia")
+        for song in sorted(GD_SONGS, key=len, reverse=True):
+            pattern = song
+            idx = text_lower.find(pattern)
+            if idx >= 0 and (idx == 0 or text_lower[idx-1] == ' '):
+                end = idx + len(song)
+                if end == len(text_lower) or text_lower[end] in (' ', '>', '&'):
+                    # Split into left and right parts
+                    left = text[:idx].strip()
+                    right = text[end:].strip()
+                    left_songs = _split_songs(left)
+                    right_songs = _split_songs(right)
+                    return left_songs + [song.title()] + right_songs
+        # No known song found — return the text as-is (single entry)
+        return [text.strip()] if text.strip() else []
+
+    def _parse_song_entry(entry_text: str) -> list:
+        """Parse a song entry that may contain '>' transitions.
+        Returns list of dicts: [{'name': 'SongA', 'transition': False}, ...]
+        """
+        entry_text = entry_text.replace('&gt;', '>').strip()
+        # First split on '>' to get segments
+        segments = entry_text.split('>')
+        segments = [s.strip() for s in segments if s.strip()]
+        songs = []
+        for i, seg in enumerate(segments):
+            song_parts = _split_songs(seg)
+            for song_name in song_parts:
+                song_name = song_name.strip()
+                if not song_name:
+                    continue
+                is_transition = (i > 0)
+                songs.append({
+                    'name': song_name,
+                    'transition': is_transition,
+                })
+                if i > 0:
+                    prev_name = songs[-2]['name'] if len(songs) >= 2 else ''
+                    if prev_name:
+                        result['transitions'].append({
+                            'from': prev_name,
+                            'to': song_name,
+                        })
+        return songs
 
     for entry in sl:
         if isinstance(entry, str):
-            if entry.lower().startswith(('set ', 'disc ', 'encore')):
-                # New set detected
-                set_name = entry.lower().replace('encore', 'Encore')
+            entry_clean = entry.replace('&gt;', '>').strip()
+
+            # Check if this is a set marker (e.g., "Set I", "Set II", "Encore")
+            set_pattern = re.match(r'^(Set\s+[IVX]+|Disc\s+\d+|Encore)\s*(.*)', entry_clean, re.IGNORECASE)
+            if set_pattern:
+                set_name = set_pattern.group(1)
+                rest = set_pattern.group(2).strip()
                 current_set = {
                     'name': set_name,
                     'order': len(result['sets']),
                     'songs': []
                 }
                 result['sets'].append(current_set)
+                if not result['raw_description']:
+                    result['raw_description'] = entry_clean
+                # Process songs after the set marker on the same line
+                if rest:
+                    parsed_songs = _parse_song_entry(rest)
+                    for s in parsed_songs:
+                        current_set['songs'].append(s)
+                        result['songs'].append(s['name'])
                 continue
 
-            # Check for transitions
-            song_entry = {'name': '', 'transition': False}
+            # Check if this is a musician info line
+            if ' - ' in entry_clean and any(x in entry_clean.lower() for x in ['guitar', 'bass', 'drums', 'keyboards']):
+                if current_set is None:
+                    current_set = {'name': 'Set I', 'order': 0, 'songs': []}
+                    result['sets'].append(current_set)
+                current_set['musicians'] = entry_clean
+                result['raw_description'] = entry_clean
+                continue
 
-            entry = entry.replace('&gt;', '>').strip()
-            if '>' in entry or '->' in entry:
-                sep = '->' if '->' in entry else '>'
-                parts = entry.split(sep)
-                song_entry['name'] = parts[0].strip()
-                song_entry['transition'] = True
-                result['transitions'].append({
-                    'from': parts[0].strip(),
-                    'to': parts[1].strip() if len(parts) > 1 else ''
-                })
-            else:
-                song_entry['name'] = entry
-
-            if song_entry['name']:
-                current_set['songs'].append(song_entry)
-                result['songs'].append(song_entry['name'])
+            # Parse as song entries
+            if current_set is None:
+                current_set = {'name': 'Set I', 'order': 0, 'songs': []}
+                result['sets'].append(current_set)
+            try:
+                parsed = _parse_song_entry(entry_clean)
+                for s in parsed:
+                    current_set['songs'].append(s)
+                    result['songs'].append(s['name'])
+            except Exception:
+                pass
 
     return result
 
