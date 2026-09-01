@@ -7,7 +7,7 @@ scrape the entire GratefulDead collection on archive.org.
 
 Features:
 - Resumeable: tracks processed show IDs in a state file
-- Year-based pagination: iterates 1965-2009 to avoid IA's non-random "random" sort
+- Year-based pagination: iterates 1965-1995 to avoid IA's non-random "random" sort
 - Configurable: target shows per run, delay, start year
 - Incremental saves: progress saved every 10 shows
 - Setlist capture: parses song lists from IA metadata descriptions
@@ -571,6 +571,14 @@ def main():
 
     # Load state and existing data
     state = load_state()
+
+    # Hard guard: ensure year range is always 1965-1995 (inclusive)
+    # This prevents corrupted state files from extending beyond 1995
+    if state["current_year"] < 1965:
+        state["current_year"] = 1965
+    if state["current_year"] > 1995:
+        state["current_year"] = 1995
+
     existing_data = load_existing_data()
     all_comments = existing_data.get("comments", [])
     all_setlists = existing_data.get("setlists", {})
