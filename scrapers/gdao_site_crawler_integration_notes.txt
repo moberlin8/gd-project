@@ -1,0 +1,38 @@
+/home/mao/DaveMatt/gd-project/scrapers/gdao_site_crawler.py
+/home/mao/DaveMatt/gd-project/scrapers/
+/home/mao/DaveMatt/gd-project/gdao_tree/
+
+# GDOA Site Crawler Integration Notes
+
+## Script Source
+Adapted from `https://github.com/jaysooner/gratefulgpt-scraper-dataset/blob/main/gdao_site_crawler.py`
+
+## Fix Applied: Log Directory Creation Order
+The original script creates `gdoa_tree/` directory inside `main()` at line 211,
+but the `logging.FileHandler('gdoa_tree/crawler.log')` is called at import time
+(line 26), causing a `FileNotFoundError`.
+
+**Fix**: Move `os.makedirs('gdoa_tree', exist_ok=True)` BEFORE `logging.basicConfig()`.
+
+## Crawling Pattern
+- Breadth-first search using a deque
+- Respects 3.25s rate limiting (can override with `--delay`)
+- Exports: `gdao_links.csv` (edges), `gdao_nodes.csv` (nodes + degrees), `gdao_graph.dot` (graphviz)
+- Handles 404s and mailto: links gracefully (logs errors, continues)
+
+## Usage
+```bash
+python3 scrapers/gdao_site_crawler.py --depth 5 --delay 3.25 --start-url "https://www.gdao.org"
+```
+
+## Site Structure Discovered
+- `/shows` — show listings
+- `/items/show/{id}` — individual item pages
+- `/exhibits/show/{slug}` — exhibit pages (e.g., `europe-72`, `posters`)
+- `/solr-search` — search interface
+- `/milestones` — milestone exhibits
+
+## Future Integration Points
+- Cross-reference GDAO show metadata with IA archive.org data
+- Extract media file links from item pages
+- Map GDAO item IDs to IA identifiers

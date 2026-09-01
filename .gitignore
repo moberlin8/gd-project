@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.ve/
+
+# Environment variables (NEVER commit secrets)
+.env
+.env.local
+.env.*.local
+.env.production
+.env.staging
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS files
+Thumbs.db
+Desktop.ini
+
+# Log files (large, user-specific)
+*.log
+*.log.*
+
+# Large data files (scraped data - keep locally, don't commit)
+data/*.json
+data/*.db
+!data/.gitkeep
+data/gd_books/*
+!data/gd_books/.gitkeep
+data/scraper_state.json
+
+# FAISS index (large binary - rebuild via build_index.py)
+index/vector_index.faiss
+
+# Output files (generated - don't commit)
+output/*.md
+output/*.txt
+output/*.json
+output/*.log
+!output/.gitkeep
+
+# Research files (local experiments)
+research/*
+!research/.gitkeep
+
+# Scripts (contain paths specific to this machine)
+scripts/gd_scraper.log
+scripts/overnight_scraper.log
+scripts/extract_ep.log
+
+# Images
+images/*.jpg
+images/*.png
+images/*.jpeg
+research/
