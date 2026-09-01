@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import time
+import signal
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -209,13 +210,35 @@ def fetch_comments(identifier: str) -> tuple[list[dict], dict]:
     headers = {"User-Agent": "GD-RAT-Scraper/2.0-Incremental"}
     logger.info(f"  Fetching: {identifier}")
 
-    try:
-        resp = requests.get(url, headers=headers, timeout=30)
-        if resp.status_code == 404:
-            logger.warning(f"    404: {identifier}")
+    max_retries = 3
+    base_delay = 5
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            if resp.status_code == 404:
+                logger.warning(f"    404: {identifier}")
+                return [], {}
+            resp.raise_for_status()
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt < max_retries - 1:
+                wait = base_delay * (2 ** attempt)
+                logger.warning(f"    Request timeout (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                logger.error(f"    Failed after {max_retries} attempts: {e}")
+                return [], {}
+        except requests.exceptions.RequestException as e:
+            logger.error(f"    HTTP error for {identifier}: {e}")
             return [], {}
-        resp.raise_for_status()
+    else:
+        return [], {}
+
+    try:
         data = resp.json()
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.error(f"    JSON decode error for {identifier}: {e}")
+        return [], {}
 
         reviews = data.get("reviews", [])
 
@@ -561,6 +584,19 @@ def main():
     # Convert processed_ids to a set for fast lookup, but keep the list for state saving
     processed_ids_set = set(state["processed_ids"])
 
+    # Graceful shutdown handler — saves state on SIGTERM/SIGINT
+    shutdown_requested = False
+
+    def handle_signal(signum, frame):
+        nonlocal shutdown_requested
+        logger.info(f"\n{'!' * 60}")
+        logger.info(f"SHUTDOWN SIGNAL received (signal {signum}) — saving state and exiting gracefully...")
+        logger.info(f"{'!' * 60}")
+        shutdown_requested = True
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
     # Iterate through years until target reached
     while processed_count < args.target and state["current_year"] <= 1995:
         year = state["current_year"]
@@ -579,6 +615,9 @@ def main():
 
         for identifier in identifiers:
             if processed_count >= args.target:
+                break
+            if shutdown_requested:
+                logger.info("Shutdown requested — exiting loop")
                 break
             if identifier in state["processed_ids"]:
                 logger.info(f"  Skipping {identifier} (already processed)")
@@ -610,6 +649,10 @@ def main():
             # Rate limiting
             time.sleep(DELAY_SECONDS)
 
+        # Check for shutdown after each year's batch
+        if shutdown_requested:
+            break
+
         # Incremental save every 10 shows or at end of year
         if processed_count % 10 == 0 or processed_count == args.target:
             save_state(state)
@@ -623,9 +666,14 @@ def main():
         logger.info(f"Year {year} done. Total: {len(state['processed_ids'])} | "
                    f"With comments: {state['shows_with_comments']}")
 
-    # Final save
+    # Final save (always, even if shutdown was requested)
     save_state(state)
     save_combined_data(state, all_comments, all_setlists)
+    if shutdown_requested:
+        logger.info(f"\n{'!' * 60}")
+        logger.info(f"Graceful shutdown complete. State saved at {len(state['processed_ids'])} shows.")
+        logger.info(f"Next run will resume from year {state['current_year']}.")
+        logger.info(f"{'!' * 60}")
 
     elapsed_min = (time.time() - start_time) / 60
     logger.info(f"\n{'=' * 60}")
