@@ -1,6 +1,8 @@
 #!/bin/bash
 # run_scraper.sh — GD Comment Scraper 24/7 wrapper with retries
 # Runs the 1965-1995 year-by-year sweep with 3.25s delays between requests.
+# When all shows for 1995 are exhausted, wraps around to 1965 and starts a
+# new pass to catch newly uploaded shows. Prefers earlier years on each pass.
 # Runs continuously — no time window restriction. Resumes from saved state.
 # Implements retry-on-failure: if the scraper times out or crashes, it pauses
 # and restarts automatically, preserving progress via the state file.
