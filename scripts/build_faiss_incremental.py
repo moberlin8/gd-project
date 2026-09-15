@@ -21,6 +21,7 @@ sys.path.insert(0, "/home/mao/DaveMatt/gd-project/index")
 from build_index import normalize_setlist
 
 DATA_PATH = "/home/mao/DaveMatt/gd-project/data/gd_comments_combined.json"
+LYRICS_PATH = "/home/mao/DaveMatt/gd-project/data/gd_lyrics.json"
 INDEX_DIR = "/home/mao/DaveMatt/gd-project/index"
 BATCH_SIZE = 64  # Increased from 16 - we now have 3.8 GB RAM
 
@@ -210,6 +211,76 @@ def main():
     del ep_texts, ep_meta
     gc.collect()
 
+    # --- Process lyrics + interpretations ---
+    lyrics_entries = []  # lyric + interpretation metadata, also saved under 'lyrics'
+    if os.path.exists(LYRICS_PATH):
+        with open(LYRICS_PATH, encoding="utf-8") as f:
+            lyrics_data = json.load(f)
+
+        lyrics_texts = []
+        lyrics_meta = []
+        for title_key, song in lyrics_data.items():
+            if not isinstance(song, dict):
+                continue
+            title = song.get("title") or title_key
+            source_urls = song.get("source_urls", [])
+            lyricists = song.get("lyricists", [])
+            music_by = song.get("music_by", [])
+
+            # One vector per song's full lyrics text (type='lyric')
+            lyrics_text = (song.get("lyrics_text") or "").strip()
+            if lyrics_text:
+                lyrics_texts.append(lyrics_text)
+                lyrics_meta.append({
+                    "idx": len(metadata) + len(lyrics_meta),
+                    "title": title,
+                    "song_name": title,
+                    "source_urls": source_urls,
+                    "lyricists": lyricists,
+                    "music_by": music_by,
+                    "type": "lyric",
+                    "comment_text": lyrics_text,
+                })
+
+            # One vector per interpretation entry (type='interpretation')
+            for interp in song.get("interpretations", []):
+                if not isinstance(interp, dict):
+                    continue
+                itext = (interp.get("text") or "").strip()
+                if not itext:
+                    continue
+                lyrics_texts.append(itext)
+                lyrics_meta.append({
+                    "idx": len(metadata) + len(lyrics_meta),
+                    "title": title,
+                    "song_name": title,
+                    "source_urls": source_urls,
+                    "lyricists": lyricists,
+                    "music_by": music_by,
+                    "type": "interpretation",
+                    "interpretation_source": interp.get("source", ""),
+                    "interpretation_url": interp.get("url", ""),
+                    "comment_text": itext,
+                })
+
+        if lyrics_texts:
+            print(f"Lyrics/interpretation entries: {len(lyrics_texts)}")
+            print("Embedding lyrics + interpretations in batches...")
+            for i in range(0, len(lyrics_texts), BATCH_SIZE):
+                batch = lyrics_texts[i:i + BATCH_SIZE]
+                emb = model.encode(batch, show_progress_bar=False, convert_to_numpy=True)
+                index.add(emb)
+                del emb, batch
+                gc.collect()
+                print(f"  Lyrics progress: {i}/{len(lyrics_texts)} done", flush=True)
+            metadata.extend(lyrics_meta)
+            lyrics_entries = lyrics_meta
+            print(f"  After lyrics: {index.ntotal} vectors")
+        del lyrics_texts, lyrics_meta
+        gc.collect()
+    else:
+        print(f"NOTE: lyrics file not found at {LYRICS_PATH}, skipping lyrics section")
+
     # --- Process comments ---
     comment_texts = []
     comment_meta = []
@@ -260,7 +331,8 @@ def main():
             "comments": metadata,
             "setlists": setlists,
             "deadcast_transcripts": deadcast_transcripts,
-            "ep_durations": ep_data
+            "ep_durations": ep_data,
+            "lyrics": lyrics_entries
         }, f, indent=2, ensure_ascii=False)
 
     print(f"Saved: {faiss_path}")
