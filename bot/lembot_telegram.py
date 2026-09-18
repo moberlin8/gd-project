@@ -138,19 +138,45 @@ class LemurTGBot:
 
     def _parse_gd_args(self, text: str) -> tuple[str, str]:
         """
-        Parse arguments for /gd command.
-        Returns (action: str, question: str)
+        Parse arguments for /gd command or bare text.
+        Returns (action: str, question: str). Bare text defaults to 'ask'.
         """
         text = text.strip()
-        # Match quoted string
-        match = re.match(r'(\w+)\s*"(.+?)"', text)
-        if match:
+        match = re.match(r'(\w+)\s*"(.+?)"', text, flags=re.S)
+        if match and match.group(1).lower() in ("ask", "search", "lyrics", "meaning"):
             return match.group(1).lower(), match.group(2)
-        # Fallback: split on whitespace
         parts = text.split(None, 1)
-        action = parts[0].lower() if parts else "ask"
-        question = parts[1] if len(parts) > 1 else ""
-        return action, question
+        if parts and parts[0].lower() in ("ask", "search", "lyrics", "meaning"):
+            return parts[0].lower(), parts[1] if len(parts) > 1 else ""
+        return "ask", text
+
+    async def _send(self, update: Update, text: str, markdown: bool = False):
+        """Reply in <=4000-char chunks; if Telegram rejects Markdown, resend as plain text."""
+        chunks, limit = [], 4000
+        while len(text) > limit:
+            cut = text.rfind("\n", 0, limit)
+            cut = cut if cut > limit // 2 else limit
+            chunks.append(text[:cut]); text = text[cut:].lstrip("\n")
+        if text:
+            chunks.append(text)
+        for part in chunks:
+            try:
+                await update.message.reply_text(
+                    part, parse_mode="Markdown" if markdown else None,
+                    disable_web_page_preview=True)
+            except Exception as e:
+                if not markdown:
+                    raise
+                print(f"[WARN] Markdown send failed ({e}); resending plain", file=sys.stderr)
+                await update.message.reply_text(part, disable_web_page_preview=True)
+
+    async def text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Bare text (no /gd) — treat as a question, or 'lyrics X' / 'meaning X' / 'search X'."""
+        if not update.message or not update.message.text:
+            return
+        action, question = self._parse_gd_args(update.message.text)
+        if question:
+            await self._answer(update, context, action, question)
 
     async def gd_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /gd ask/search/lyrics/meaning \"...\"."""
@@ -160,54 +186,37 @@ class LemurTGBot:
                 "/gd ask \"your question\"\n"
                 "/gd search \"your search term\"\n"
                 "/gd lyrics \"song name\"\n"
-                "/gd meaning \"song name\""
+                "/gd meaning \"song name\"\n"
+                "…or just type a question."
             )
             return
+        action, question = self._parse_gd_args(" ".join(context.args))
+        await self._answer(update, context, action, question)
 
-        raw_args = " ".join(context.args)
-        action, question = self._parse_gd_args(raw_args)
-
-        if action not in ("ask", "search", "lyrics", "meaning"):
-            await update.message.reply_text(
-                f"Unknown action '{action}'. Use 'ask', 'search', 'lyrics', or 'meaning'."
-            )
-            return
-
+    async def _answer(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                      action: str, question: str):
         await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
         # Lyrics / meaning lookups (no LLM, plain-text output)
         if action in ("lyrics", "meaning"):
             results = search_lyrics(self.index, self.metadata, self.model, question, k=15)
-            if action == "lyrics":
-                response = format_lyrics(question, results)
-            else:
-                response = format_meaning(question, results)
-            await update.message.reply_text(
-                response, disable_web_page_preview=True
-            )
+            fmt = format_lyrics if action == "lyrics" else format_meaning
+            await self._send(update, fmt(question, results))
             return
 
         results = search(self.index, self.metadata, self.model, question, k=15)
 
         if action == "ask":
-            # Try LLM summary; fallback to extractive
-            summary = None
-            if self.openai_key:
-                summary = summarize_with_llm(question, results, self.openai_key)
-
+            summary = summarize_with_llm(question, results, self.openai_key) if self.openai_key else None
             if summary:
-                await update.message.reply_text(summary, parse_mode="Markdown")
+                await self._send(update, summary)  # plain: LLM markdown breaks Telegram's parser
             else:
-                extractive = format_results(question, results, max_items=5)
-                note = (
-                    "\n\n_No XAI_API_KEY set. "
-                    "For synthesized answers, set `XAI_API_KEY`._"
-                ) if not self.openai_key else ""
-                await update.message.reply_text(extractive + note, parse_mode="Markdown")
+                note = ("\n\n_No XAI_API_KEY set. "
+                        "For synthesized answers, set `XAI_API_KEY`._") if not self.openai_key else ""
+                await self._send(update, format_results(question, results, max_items=5) + note, markdown=True)
 
         elif action == "search":
-            response = format_results(question, results, max_items=5)
-            await update.message.reply_text(response, parse_mode="Markdown", disable_web_page_preview=True)
+            await self._send(update, format_results(question, results, max_items=5), markdown=True)
 
     async def voice_ready(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Placeholder handler for future voice flag parsing."""
@@ -215,6 +224,9 @@ class LemurTGBot:
             "🔊 Voice synthesis for Lemieux is currently offline.\n"
             "Will activate once voice training is complete."
         )
+
+    async def on_error(self, update, context):
+        print(f"[ERROR] {context.error!r}", file=sys.stderr)
 
     def run(self):
         """Start the Telegram bot."""
@@ -224,6 +236,8 @@ class LemurTGBot:
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("help", self.help))
         self.app.add_handler(CommandHandler("gd", self.gd_command))
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_message))
+        self.app.add_error_handler(self.on_error)
 
         print("🚀 Lemieux GD Telegram Bot starting...")
         print(f"   Voice enabled: {ENABLE_LEMIEU_VOICE}")
