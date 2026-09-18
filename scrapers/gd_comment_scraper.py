@@ -99,11 +99,18 @@ def load_state() -> dict:
     }
 
 
+def _atomic_json_dump(path: Path, obj, **kw):
+    """Write JSON to <path>.tmp then os.replace — a crash mid-write can't truncate the real file."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, **kw)
+    os.replace(tmp, path)
+
+
 def save_state(state: dict):
     """Save scraper state."""
     state["last_save"] = datetime.now().isoformat()
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    _atomic_json_dump(STATE_FILE, state, indent=2)
 
 
 def load_existing_data() -> dict:
@@ -122,30 +129,34 @@ def load_existing_data() -> dict:
 
 
 def save_combined_data(state: dict, all_comments: list, all_setlists: dict):
-    """Save merged dataset to the canonical combined file."""
+    """Save merged dataset to the canonical combined file. Metrics are derived from the
+    data itself (not the state counters) so they can never drift from the file contents."""
     data = load_existing_data()
     data["comments"] = all_comments
     data["setlists"] = all_setlists
     data["shows_processed"] = state["processed_ids"]
     data["metadata"] = {
         "shows_attempted": len(state["processed_ids"]),
-        "shows_with_comments": state["shows_with_comments"],
-        "comments_total": state["total_comments"],
-        "setlists_total": state["total_setlists"],
+        "shows_with_comments": len({c["show_identifier"] for c in all_comments}),
+        "comments_total": len(all_comments),
+        "setlists_total": len(all_setlists),
         "last_updated": datetime.now().isoformat(),
         "last_save": state["last_save"],
     }
     data["timestamp"] = datetime.now().isoformat()
-    with open(COMBINED_OUTPUT, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    _atomic_json_dump(COMBINED_OUTPUT, data, indent=2, ensure_ascii=False)
 
 
-def search_shows_paginated(year: int, processed_ids: set, target_count: int) -> list[str]:
+def search_shows_paginated(year: int, processed_ids: set, target_count: int) -> tuple[list[str], bool]:
     """
-    Fetch ALL Grateful Dead identifiers from IA for a year, paginating through results.
-    Stops early if we've found enough new (unprocessed) shows.
+    Fetch Grateful Dead identifiers from IA for a year, paginating through results.
+    Stops early once ``target_count`` new (unprocessed) shows are found.
 
-    Uses IA's 'start' parameter for pagination, max 100 rows per page.
+    Pages against IA's ``response.numFound`` so a year is only reported exhausted
+    when every result page has actually been read.
+    Returns (new_identifiers, exhausted). ``exhausted`` is False if we stopped
+    early (target reached) or a request failed — callers must not mark the year
+    fully scanned in either case.
     """
     url = f"{BASE_URL}/advancedsearch.php"
     query = f"collection:{COLLECTION} AND creator:Grateful Dead AND date:[{year}-01-01 TO {year}-12-31]"
@@ -154,8 +165,7 @@ def search_shows_paginated(year: int, processed_ids: set, target_count: int) -> 
     start = 0
     rows_per_page = 100
     max_pages = 200  # 200 pages × 100 = 20,000 max results (covers even busiest years)
-    consecutive_empty_pages = 0  # Break early if year is fully scanned
-    stale_threshold = 5  # Stop after 5 consecutive pages with 0 new shows
+    num_found = None
 
     for page_num in range(max_pages):
         params = {
@@ -163,15 +173,20 @@ def search_shows_paginated(year: int, processed_ids: set, target_count: int) -> 
             "fl": "identifier",
             "rows": rows_per_page,
             "start": start,
+            "sort": "identifier asc",  # stable order — IA's default sort repeats items across pages
             "output": "json"
         }
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=30)
             resp.raise_for_status()
             data = resp.json()
-            docs = data.get("response", {}).get("docs", [])
+            response = data.get("response", {})
+            docs = response.get("docs", [])
+            if num_found is None:
+                num_found = int(response.get("numFound", 0))
+                logger.info(f"  Year {year}: IA reports {num_found} items")
             if not docs:
-                break
+                return all_identifiers, True
 
             new_found = 0
             for doc in docs:
@@ -180,37 +195,23 @@ def search_shows_paginated(year: int, processed_ids: set, target_count: int) -> 
                     all_identifiers.append(identifier)
                     processed_ids.add(identifier)
                     new_found += 1
-                    # Stop early if we have enough
                     if len(all_identifiers) >= target_count:
-                        return all_identifiers
+                        return all_identifiers, False  # stopped early, not exhausted
 
-            start += rows_per_page
-            total_responses = start + len(docs)
-            logger.info(f"  Year {year}: fetched {total_responses} total, {new_found} new this page")
+            start += len(docs)
+            logger.info(f"  Year {year}: read {start}/{num_found}, {new_found} new this page")
 
-            # Early termination: if 5 consecutive pages have 0 new shows,
-            # this year is fully scanned — no need to page through 20,000 results
-            if new_found == 0:
-                consecutive_empty_pages += 1
-                if consecutive_empty_pages >= stale_threshold:
-                    logger.info(f"  Year {year}: no new shows in {stale_threshold} consecutive pages, stopping early")
-                    break
-            else:
-                consecutive_empty_pages = 0
-
-            # If this page was full, there might be more — continue
-            # If it wasn't full, we've reached the end
-            if len(docs) < rows_per_page:
-                break
+            if start >= num_found:
+                break  # every page read
 
             time.sleep(0.1)  # short pause between pages for same-year requests
 
         except Exception as e:
             logger.error(f"  Search failed for {year} page {page_num}: {e}")
-            break
+            return all_identifiers, False
 
-    logger.info(f"  Year {year}: collected {len(all_identifiers)} new shows (total fetched so far: {len(processed_ids)})")
-    return all_identifiers
+    logger.info(f"  Year {year}: collected {len(all_identifiers)} new shows (total known: {len(processed_ids)})")
+    return all_identifiers, True
 
 
 def fetch_comments(identifier: str) -> tuple[list[dict], dict]:
@@ -556,6 +557,34 @@ def extract_comment_data(identifier: str, review: dict) -> dict:
     }
 
 
+def process_show(identifier: str, state: dict, all_comments: list, all_setlists: dict) -> None:
+    """Fetch one show and merge its reviews + setlist into the in-memory data.
+    Every review is kept (``is_relevant`` stays as a flag for query-time filtering).
+    Re-fetching a show replaces its previous comments rather than duplicating them."""
+    result = fetch_comments(identifier)
+    if result is None:
+        logger.error(f"    fetch_comments returned None for {identifier}, skipping")
+        return
+    raw_reviews, setlist = result
+    if raw_reviews:
+        all_comments[:] = [c for c in all_comments if c["show_identifier"] != identifier]
+        for review in raw_reviews:
+            all_comments.append(extract_comment_data(identifier, review))
+        state["shows_with_comments"] += 1
+        state["total_comments"] += len(raw_reviews)
+        logger.info(f"    ✓ {len(raw_reviews)} comments")
+    else:
+        logger.info(f"    No comments for this item")
+
+    if setlist:
+        if identifier not in all_setlists:
+            state["total_setlists"] += 1
+        all_setlists[identifier] = setlist
+        song_count = len(setlist.get('songs', []))
+        if song_count:
+            logger.info(f"    Setlist: {song_count} songs")
+
+
 def main():
     parser = argparse.ArgumentParser(description="GD Comment Scraper — Incremental Overnight Mode")
     parser.add_argument("--target", type=int, default=50,
@@ -566,6 +595,10 @@ def main():
                         help="Delay between requests in seconds (default: 2.0)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be scraped without making requests")
+    parser.add_argument("--refetch-missing", action="store_true",
+                        help="Recovery mode: re-fetch shows already in processed_ids that have no "
+                             "setlist in the combined file (data lost to the Sep 2026 truncated write). "
+                             "Honors --target/--delay; safe to re-run until nothing is missing.")
     args = parser.parse_args()
 
     global DELAY_SECONDS
@@ -614,6 +647,33 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
+    # ── Recovery mode: re-fetch already-processed shows whose data was lost ──
+    if args.refetch_missing:
+        missing = [i for i in state["processed_ids"] if i not in all_setlists]
+        logger.info(f"REFETCH: {len(missing)} of {len(state['processed_ids'])} processed shows have no "
+                    f"setlist/comments on disk; doing up to {args.target} this run")
+        if args.dry_run:
+            for ident in missing[:args.target]:
+                logger.info(f"  - {ident}")
+            return
+        for identifier in missing[:args.target]:
+            if shutdown_requested:
+                break
+            processed_count += 1
+            logger.info(f"\n[Refetch {processed_count}/{min(args.target, len(missing))}] {identifier}")
+            process_show(identifier, state, all_comments, all_setlists)
+            if processed_count % 10 == 0:
+                save_state(state)
+                save_combined_data(state, all_comments, all_setlists)
+                logger.info(f"  Progress saved: {len(all_comments)} comments, {len(all_setlists)} setlists")
+            time.sleep(DELAY_SECONDS)
+        save_state(state)
+        save_combined_data(state, all_comments, all_setlists)
+        logger.info(f"REFETCH DONE — {processed_count} shows this run | still missing: "
+                    f"{len([i for i in state['processed_ids'] if i not in all_setlists])} | "
+                    f"comments: {len(all_comments)} | setlists: {len(all_setlists)}")
+        return
+
     # Iterate through years until target reached
     # Wraps around from 1995 back to 1965 to prefer earlier shows
     while processed_count < args.target:
@@ -639,12 +699,15 @@ def main():
             save_state(state)
             continue
         
-        identifiers = search_shows_paginated(year, processed_ids_set, args.target - processed_count)
+        identifiers, exhausted = search_shows_paginated(year, processed_ids_set, args.target - processed_count)
         
         if not identifiers:
-            logger.info(f"No shows for {year}, advancing to {year + 1}")
-            fully_scanned_years.add(year)
-            state["fully_scanned_years"] = list(fully_scanned_years)
+            if exhausted:
+                logger.info(f"No new shows for {year} (all pages read), marking fully scanned")
+                fully_scanned_years.add(year)
+                state["fully_scanned_years"] = list(fully_scanned_years)
+            else:
+                logger.warning(f"Year {year} search incomplete (error) — will retry next pass")
             state["current_year"] += 1
             continue
 
@@ -669,27 +732,7 @@ def main():
             processed_count += 1
             logger.info(f"\n[Run attempt {processed_count}/{args.target}] {identifier}")
 
-            result = fetch_comments(identifier)
-            if result is None:
-                logger.error(f"    fetch_comments returned None for {identifier}, skipping")
-                continue
-            raw_reviews, setlist = result
-            if raw_reviews:
-                state["shows_with_comments"] += 1
-                for review in raw_reviews:
-                    comment_data = extract_comment_data(identifier, review)
-                    if comment_data["is_relevant"]:
-                        all_comments.append(comment_data)
-                        logger.info(f"    ✓ Relevant: {comment_data['reviewer']}")
-                state["total_comments"] += len([c for c in all_comments if c["show_identifier"] == identifier])
-            else:
-                logger.info(f"    No comments for this item")
-
-            if setlist:
-                all_setlists[identifier] = setlist
-                state["total_setlists"] += 1
-                song_count = len(setlist.get('songs', []))
-                logger.info(f"    Setlist: {song_count} songs" if song_count else "")
+            process_show(identifier, state, all_comments, all_setlists)
 
             # Rate limiting
             time.sleep(DELAY_SECONDS)
