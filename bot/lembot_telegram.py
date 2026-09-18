@@ -7,7 +7,7 @@ used by the Hermes MCP server (lemieux).
 
 Architecture:
     [Telegram User] → [@BotFather token] → python-telegram-bot →
-    FAISS + SentenceTransformer → (optional OpenAI LLM summary) →
+    FAISS + SentenceTransformer (lembot_core) → (optional Grok summary) →
     back to Telegram chat
 
 Voice note support:
@@ -19,7 +19,7 @@ Voice note support:
 Setup:
     1. Talk to @BotFather on Telegram, run /newbot
     2. Set LEMIEUX_TELEGRAM_TOKEN=<token>
-    3. Optional: set OPENAI_API_KEY for LLM-synthesized answers
+    3. Optional: set XAI_API_KEY for Grok-synthesized answers
     4. python3 lembot_telegram.py
 
 Commands:
@@ -33,17 +33,12 @@ Author: Hal (Douglas Raines persona system)
 """
 
 import argparse
-import json
 import os
 import re
 import shutil
 import sys
 from pathlib import Path
 from typing import Optional
-
-import faiss
-import numpy as np
-from sentence_transformers import SentenceTransformer
 
 # python-telegram-bot v20+ async API
 from telegram import Update, InputFile
@@ -55,15 +50,13 @@ from telegram.ext import (
     filters,
 )
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-PROJECT_DIR = Path("/home/mao/DaveMatt/gd-project")
-INDEX_DIR = PROJECT_DIR / "index"
-INDEX_PATH = INDEX_DIR / "vector_index.faiss"
-META_PATH = INDEX_DIR / "index_metadata.json"
+# ── Shared RAG core ───────────────────────────────────────────────────────────
+from lembot_core import (  # noqa: E402
+    PROJECT_DIR, load_rat, search, search_lyrics, format_lyrics, format_meaning,
+    summarize_with_llm, show_url as format_show_url,
+)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
 TOKEN_ENV_KEY = "LEMIEUX_TELEGRAM_TOKEN"
-OPENAI_KEY_ENV = "OPENAI_API_KEY"
 PIPER_BINARY = shutil.which("piper")  # may be None
 PIPER_MODEL_DIR = Path("/home/hermes/.hermes/hal_voices/piper_hal_model")
 WAV_OUTPUT_DIR = PROJECT_DIR / "bot" / "output"
@@ -71,104 +64,6 @@ WAV_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Placeholder: only activates once Lemur voice is trained
 ENABLE_LEMIEU_VOICE = os.environ.get("ENABLE_LEMIEU_VOICE", "false").lower() == "true"
-
-
-# ── RAG Core (duplicated from Hermes MCP for independence) ─────────────────
-def load_rat():
-    """Load FAISS index, metadata, and embedding model.
-
-    Returns (index, metadata, lyrics, model) where ``metadata`` is the flat
-    list aligned to the FAISS index (contains lyric + interpretation entries
-    too) and ``lyrics`` is the dedicated 'lyrics' key (lyric/interpretation
-    entries only).
-    """
-    if not INDEX_PATH.exists():
-        raise FileNotFoundError(f"FAISS index not found at {INDEX_PATH}")
-    index = faiss.read_index(str(INDEX_PATH))
-    with open(META_PATH, encoding="utf-8") as f:
-        raw = json.load(f)
-    if isinstance(raw, list):
-        metadata = raw
-        lyrics = raw
-    else:
-        metadata = raw.get('comments', [])
-        lyrics = raw.get('lyrics', [])
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    return index, metadata, lyrics, model
-
-
-def search(index, metadata, model, query: str, k: int = 10):
-    """Vector search over GD archive comments."""
-    q_vec = model.encode([query], convert_to_numpy=True)
-    distances, indices = index.search(q_vec, k)
-    results = []
-    for dist, idx in zip(distances[0], indices[0]):
-        if idx < 0 or idx >= len(metadata):
-            continue
-        results.append({"score": float(dist), "meta": metadata[idx]})
-    return results
-
-
-def _norm_name(s: str) -> str:
-    """Lowercase, strip punctuation for fuzzy name matching."""
-    return re.sub(r"[^a-z0-9 ]", "", s.lower()).strip()
-
-
-def search_lyrics(index, metadata, model, query: str, k: int = 15,
-                  target_types=("lyric", "interpretation")):
-    """Find lyrics + interpretation entries for a song lookup.
-
-    Song-name queries are easily crowded out of a pure vector search by the
-    thousands of setlist vectors (each song appears in many shows), so we rank
-    lyric/interpretation entries by song_name match first and top up the rest
-    with filtered vector-search hits. Entries are ordered lyrics before
-    interpretations by the caller's format functions.
-    """
-    q = _norm_name(query)
-    q_tokens = set(q.split())
-
-    lyric_entries = [
-        m for m in metadata
-        if m.get("type") in target_types and m.get("song_name")
-    ]
-
-    scored = []
-    for m in lyric_entries:
-        nm = _norm_name(m.get("song_name", ""))
-        if not nm:
-            continue
-        if nm == q:
-            score = 1.0
-        elif q and (q in nm or nm in q):
-            score = 0.8
-        else:
-            inter = len(q_tokens & set(nm.split()))
-            denom = max(len(q_tokens), len(nm.split()), 1)
-            score = 0.5 * inter / denom
-        scored.append((score, m))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    hits = [m for s, m in scored if s > 0.0]
-
-    # Top up with filtered vector hits when lexical match comes up short.
-    if len(hits) < k:
-        q_vec = model.encode([query], convert_to_numpy=True)
-        wide = max(k * 4, 20)
-        distances, indices = index.search(q_vec, wide)
-        for dist, idx in zip(distances[0], indices[0]):
-            if idx < 0 or idx >= len(metadata):
-                continue
-            m = metadata[idx]
-            if m.get("type") in target_types and m not in hits:
-                hits.append(m)
-            if len(hits) >= k:
-                break
-
-    return [{"score": 1.0 - i * 0.001, "meta": m} for i, m in enumerate(hits[:k])]
-
-
-def format_show_url(show_id: str) -> str:
-    return f"https://archive.org/details/{show_id}"
 
 
 def format_results(query: str, results: list[dict], max_items: int = 5) -> str:
@@ -181,7 +76,7 @@ def format_results(query: str, results: list[dict], max_items: int = 5) -> str:
         text = m.get("comment_text", "")[:400]
         text = text[:-3] + "..." if len(text) > 400 else text
         lines.append(
-            f"*{i}* [{m['show_identifier']}]({format_show_url(m['show_identifier'])})\n"
+            f"*{i}* [{m.get('show_identifier', '?')}]({format_show_url(m.get('show_identifier', ''))})\n"
             f"Rating: {m.get('rating', 'N/A')}/5 | Date: {m.get('created', 'N/A')}\n"
             f"{text}\n"
         )
@@ -190,97 +85,6 @@ def format_results(query: str, results: list[dict], max_items: int = 5) -> str:
         f"Use `/gd search \"text\"` for more._"
     )
     return "\n".join(lines)
-
-
-def format_lyrics(query: str, results: list[dict], max_lyrics: int = 1) -> str:
-    """Format a lyric lookup: song title + source URLs + full lyrics text.
-
-    Plain-text output (no parse_mode) so lyric characters can't break
-    Telegram Markdown.
-    """
-    lyric_hits = [r for r in results if r["meta"].get("type") == "lyric"]
-    if not lyric_hits:
-        return f"No lyrics found matching \"{query}\". Try meaning:\"song name\"."
-    lines = [f"LYRICS — {query}\n"]
-    for r in lyric_hits[:max_lyrics]:
-        m = r["meta"]
-        urls = m.get("source_urls", []) or []
-        url_block = "\n".join(f"  • {u}" for u in urls) if urls else "  (no source URLs)"
-        lyricists = ", ".join(m.get("lyricists", []) or []) or "n/a"
-        music_by = ", ".join(m.get("music_by", []) or []) or "n/a"
-        lines.append(
-            f"Song: {m.get('song_name', m.get('title', '?'))}\n"
-            f"Lyricists: {lyricists} | Music: {music_by}\n"
-            f"Sources:\n{url_block}\n\n"
-            f"{m.get('comment_text', '')}"
-        )
-    lines.append("\n\nTip: use meaning:\"song name\" for lyrics + interpretations.")
-    return "\n".join(lines)
-
-
-def format_meaning(query: str, results: list[dict]) -> str:
-    """Format a meaning lookup: song lyrics + all interpretations.
-
-    Plain-text output (no parse_mode) to avoid Telegram Markdown breakage.
-    """
-    lyric_hits = [r for r in results if r["meta"].get("type") == "lyric"]
-    interp_hits = [r for r in results if r["meta"].get("type") == "interpretation"]
-    if not lyric_hits and not interp_hits:
-        return f"No lyrics or interpretations found matching \"{query}\"."
-    lines = [f"MEANING — {query}\n"]
-
-    if lyric_hits:
-        m = lyric_hits[0]["meta"]
-        urls = m.get("source_urls", []) or []
-        url_block = "\n".join(f"  • {u}" for u in urls) if urls else "  (no source URLs)"
-        lines.append(
-            f"Song: {m.get('song_name', m.get('title', '?'))}\n"
-            f"Sources:\n{url_block}\n\n"
-            f"{m.get('comment_text', '')}"
-        )
-
-    if interp_hits:
-        lines.append("\n\nINTERPRETATIONS")
-        for i, r in enumerate(interp_hits, 1):
-            m = r["meta"]
-            src = m.get("interpretation_source", "")
-            iurl = m.get("interpretation_url", "")
-            header = f"{i}. {src}" + (f" — {iurl}" if iurl else "")
-            lines.append(f"\n{header}\n{m.get('comment_text', '')[:800]}")
-    return "\n".join(lines)
-
-
-def summarize_with_llm(query, results, api_key) -> Optional[str]:
-    """Use OpenAI to synthesize a natural-language answer from retrieved comments."""
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        context_parts = []
-        for i, r in enumerate(results, 1):
-            m = r["meta"]
-            context_parts.append(
-                f"[{i}] Show: {m.get('show_identifier', '')} "
-                f"(rating: {m.get('rating','N/A')}/5, date: {m.get('created','N/A')})\n"
-                f"Comment: {m.get('comment_text','')}"
-            )
-        context = "\n\n".join(context_parts)
-        prompt = (
-            f"You are \"Douglas,\" a Grateful Dead knowledge bot. The user asked: \"{query}\"\n\n"
-            f"Based on {len(results)} relevant fan comments from archive.org, "
-            f"provide a concise answer. Cite specific shows with archive.org links. "
-            f"Stay grounded in the comments — do not invent facts.\n\n"
-            f"Fan comments:\n{context}"
-        )
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=1000,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[WARN] OpenAI synthesis failed: {e}", file=sys.stderr)
-        return None
 
 
 # ── Telegram Bot ──────────────────────────────────────────────────────────────
@@ -293,7 +97,7 @@ class LemurTGBot:
         self.metadata = None
         self.lyrics = None
         self.model = None
-        self.openai_key: Optional[str] = os.environ.get(OPENAI_KEY_ENV)
+        self.openai_key: Optional[str] = os.environ.get("XAI_API_KEY")
         self._load_rat()
 
     def _load_rat(self):
@@ -396,8 +200,8 @@ class LemurTGBot:
             else:
                 extractive = format_results(question, results, max_items=5)
                 note = (
-                    "\n\n_No OpenAI API key set. "
-                    "For synthesized answers, set `OPENAI_API_KEY`._"
+                    "\n\n_No XAI_API_KEY set. "
+                    "For synthesized answers, set `XAI_API_KEY`._"
                 ) if not self.openai_key else ""
                 await update.message.reply_text(extractive + note, parse_mode="Markdown")
 
@@ -423,7 +227,7 @@ class LemurTGBot:
 
         print("🚀 Lemieux GD Telegram Bot starting...")
         print(f"   Voice enabled: {ENABLE_LEMIEU_VOICE}")
-        print(f"   OpenAI key: {'✅' if self.openai_key else '❌'}")
+        print(f"   LLM key: {'✅' if self.openai_key else '❌'}")
 
         self.app.run_polling()
         print("👋 Bot stopped.")
