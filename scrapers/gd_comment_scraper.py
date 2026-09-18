@@ -154,6 +154,8 @@ def search_shows_paginated(year: int, processed_ids: set, target_count: int) -> 
     start = 0
     rows_per_page = 100
     max_pages = 200  # 200 pages × 100 = 20,000 max results (covers even busiest years)
+    consecutive_empty_pages = 0  # Break early if year is fully scanned
+    stale_threshold = 5  # Stop after 5 consecutive pages with 0 new shows
 
     for page_num in range(max_pages):
         params = {
@@ -185,6 +187,16 @@ def search_shows_paginated(year: int, processed_ids: set, target_count: int) -> 
             start += rows_per_page
             total_responses = start + len(docs)
             logger.info(f"  Year {year}: fetched {total_responses} total, {new_found} new this page")
+
+            # Early termination: if 5 consecutive pages have 0 new shows,
+            # this year is fully scanned — no need to page through 20,000 results
+            if new_found == 0:
+                consecutive_empty_pages += 1
+                if consecutive_empty_pages >= stale_threshold:
+                    logger.info(f"  Year {year}: no new shows in {stale_threshold} consecutive pages, stopping early")
+                    break
+            else:
+                consecutive_empty_pages = 0
 
             # If this page was full, there might be more — continue
             # If it wasn't full, we've reached the end
@@ -608,17 +620,23 @@ def main():
         year = state["current_year"]
         
         # Wrap around: when we've gone past 1995, start over at 1965
+        # But DON'T clear fully_scanned_years — if all years are scanned, we have no new work
         if year > 1995:
             state["current_year"] = 1965
-            fully_scanned_years.clear()
-            state["fully_scanned_years"] = []
-            logger.info(f"=== Wrapped around to 1965 (new pass) ===")
+            if len(fully_scanned_years) >= 31:  # All years 1965-1995 fully scanned
+                logger.info("=== All 31 years (1965-1995) fully scanned — no new shows found ===")
+                logger.info("Scraper exiting. Next cron run will re-check if IA has new uploads.")
+                save_state(state)
+                break
+            logger.info(f"=== Wrapped around to 1965 (new pass) — {len(fully_scanned_years)} years already scanned ===")
+            save_state(state)
             continue
         
         # Skip years already fully scanned in this pass
         if year in fully_scanned_years:
-            logger.info(f"Year {year} already fully scanned, advancing to {year + 1}")
-            state["current_year"] += 1
+            logger.info(f"Year {year} already fully scanned, skipping to {year + 1}")
+            state["current_year"] = year + 1
+            save_state(state)
             continue
         
         identifiers = search_shows_paginated(year, processed_ids_set, args.target - processed_count)

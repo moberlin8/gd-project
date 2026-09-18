@@ -18,13 +18,16 @@ from collections import deque
 import argparse
 import os
 
-# Configure logging
-os.makedirs('gdao_tree', exist_ok=True)
+# Configure logging — must use absolute path since cwd may vary
+from pathlib import Path
+GD_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+GDAO_TREE_DIR = GD_PROJECT_ROOT / "gdao_tree"
+GDAO_TREE_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('gdao_tree/crawler.log'),
+        logging.FileHandler(str(GDAO_TREE_DIR / 'crawler.log')),
         logging.StreamHandler()
     ]
 )
@@ -119,7 +122,7 @@ class GDAOSiteCrawler:
     
     def export_csv(self, filename):
         """Export the graph as CSV (edges list)"""
-        csv_path = f"gdoa_tree/{filename}"
+        csv_path = str(GDAO_TREE_DIR / filename)
         with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['source', 'target', 'source_depth', 'target_depth'])
@@ -133,7 +136,7 @@ class GDAOSiteCrawler:
     
     def export_nodes_csv(self, filename):
         """Export nodes as CSV"""
-        csv_path = f"gdoa_tree/{filename}"
+        csv_path = str(GDAO_TREE_DIR / filename)
         with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['url', 'depth', 'in_degree', 'out_degree'])
@@ -148,7 +151,7 @@ class GDAOSiteCrawler:
     
     def export_dot(self, filename):
         """Export the graph as DOT file for visualization"""
-        dot_path = f"gdoa_tree/{filename}"
+        dot_path = str(GDAO_TREE_DIR / filename)
         
         # Create DOT content
         dot_content = ["digraph GDAO {"]
@@ -208,9 +211,6 @@ def main():
     
     args = parser.parse_args()
     
-    # Create output directory
-    os.makedirs('gdoa_tree', exist_ok=True)
-    
     # Initialize and run crawler
     crawler = GDAOSiteCrawler(
         start_url=args.start_url,
@@ -229,11 +229,11 @@ def main():
     crawler.print_stats()
     
     print(f"\n=== Output Files ===")
-    print(f"Links CSV: gdoa_tree/gdao_links.csv")
-    print(f"Nodes CSV: gdoa_tree/gdao_nodes.csv")
-    print(f"DOT file: gdoa_tree/gdao_graph.dot")
-    print(f"Log file: gdoa_tree/crawler.log")
-    print(f"\nTo visualize the DOT file, use: dot -Tpng gdoa_tree/gdao_graph.dot -o gdoa_tree/gdao_graph.png")
+    print(f"Links CSV: {GDAO_TREE_DIR}/gdao_links.csv")
+    print(f"Nodes CSV: {GDAO_TREE_DIR}/gdao_nodes.csv")
+    print(f"DOT file: {GDAO_TREE_DIR}/gdao_graph.dot")
+    print(f"Log file: {GDAO_TREE_DIR}/crawler.log")
+    print(f"\nTo visualize the DOT file, use: dot -Tpng {GDAO_TREE_DIR}/gdao_graph.dot -o {GDAO_TREE_DIR}/gdao_graph.png")
 
 if __name__ == "__main__":
     main()
