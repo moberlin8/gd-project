@@ -3,6 +3,10 @@
 Reddit scraper for r/gratefuldead
 Captures show discussions, reviews, setlist commentary, and historical content
 Uses Reddit's public JSON API (no authentication required)
+
+NOTE: DEPRECATED-ish. Reddit now blocks unauthenticated public JSON endpoints
+with an HTTP 403 bot-wall. Prefer the reddit path in gd_lyrics_scraper.py;
+this script is kept for reference.
 """
 
 import requests
@@ -10,6 +14,7 @@ import json
 import time
 import os
 import re
+import random
 from datetime import datetime
 
 # Output paths
@@ -31,18 +36,46 @@ def log(message):
     with open(LOG_FILE, 'a') as f:
         f.write(log_entry + '\n')
 
+# Retry backoff delays (seconds); patched in tests to tiny values.
+BACKOFF_DELAYS = [1, 2, 4]
+
+# Set once a 403 (bot-wall) is seen so the rest of the run stops hammering Reddit.
+_was_403_blocked = False
+
 def get_reddit_json(url):
-    """Fetch JSON data from Reddit's public API"""
+    """Fetch JSON data from Reddit's public API.
+
+    Retries transient failures up to 3 times with exponential backoff (1s, 2s,
+    4s) plus jitter. On a 403 bot-wall, logs one 'blocked' line, sets the
+    run-wide block flag (aborting remaining requests), and returns None. On a
+    final retry failure logs and returns None instead of raising, so callers
+    must handle a None return.
+    """
+    global _was_403_blocked
+    if _was_403_blocked:
+        return None  # Don't hammer after a bot-wall
     headers = {
         'User-Agent': 'GD-RAT/1.0 (by /u/HermesAgent) - Grateful Dead RAG scraper'
     }
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        log(f"Request failed for {url}: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 403:
+                _was_403_blocked = True
+                log("blocked (HTTP 403) — Reddit bot-wall; stopping further requests for this run")
+                return None
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            if _was_403_blocked:
+                return None
+            if attempt < 2:
+                delay = BACKOFF_DELAYS[attempt] + random.uniform(0, 0.5)
+                log(f"Request failed for {url}: {e}; retrying in {delay:.2f}s")
+                time.sleep(delay)
+            else:
+                log(f"Request failed for {url}: {e}")
+    return None
 
 def extract_comments(data, max_comments=50):
     """Recursively extract comments from Reddit JSON structure"""
@@ -147,6 +180,9 @@ def scrape_reddit():
             # Fetch comments for this post
             comments_url = f"https://www.reddit.com/r/{SUBREDDIT}/comments/{post_id}.json"
             comment_data = get_reddit_json(comments_url)
+            if _was_403_blocked:
+                log("Aborting remaining requests (Reddit bot-wall)")
+                break
             comments = []
             if comment_data and len(comment_data) > 1:
                 comments = extract_comments(comment_data[1]['data']['children'], max_comments=50)
@@ -180,10 +216,12 @@ def scrape_reddit():
             time.sleep(REQUEST_DELAY)
             continue
     
-    # Save combined data
+    # Save combined data (atomic write via tmp + os.replace)
     all_data = existing_data + new_entries
-    with open(OUTPUT_FILE, 'w') as f:
+    tmp_path = OUTPUT_FILE + '.tmp'
+    with open(tmp_path, 'w') as f:
         json.dump(all_data, f, indent=2)
+    os.replace(tmp_path, OUTPUT_FILE)
     
     log(f"\nScraping complete!")
     log(f"New entries: {len(new_entries)}")

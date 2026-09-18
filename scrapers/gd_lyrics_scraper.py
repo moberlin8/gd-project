@@ -311,9 +311,17 @@ class NameIndex:
 
 def clean_song_name(name: str) -> str:
     n = html_mod.unescape(name)
+    n = re.sub(r"\[\d{1,2}:\d{2}(?:\.\d+)?\]", " ", n)        # '[7:52]' durations
+    n = re.sub(r"^\s*d\d+t\d+[\s:. -]*", " ", n, flags=re.I)  # 'd2t01 - ', 'd2t02 '
+    n = re.sub(r"^\d{1,2}:\d{2}(?:\.\d+)?\s*", " ", n)        # timecode after dNtNN
     n = re.sub(r"\s+", " ", n).strip()
-    n = re.sub(r"^[\*\#$%\-\u2013\u2014]+\s*", "", n)
-    n = re.sub(r"^\(\d+\)\s*", "", n)
+    for _ in range(2):  # leading bullets, '(12)', track numbers / separators
+        before = n
+        n = re.sub(r"^[\*#$%\-\u2013\u2014]+\s*", "", n)
+        n = re.sub(r"^\(\d+\)\s*", "", n)
+        n = re.sub(r"^\d+[.:\-]?\s+", "", n)                  # '08 ' / '1. ' / '7: '
+        if n == before:
+            break
     n = re.sub(r"\s*\(note \d+\)\s*$", "", n, flags=re.I)
     n = re.sub(r"\s*(?:&gt;|>|->|,)+\s*$", "", n)
     return n.strip()
@@ -395,6 +403,43 @@ def build_songlist() -> Dict[str, Any]:
         len(songs), len(setlists), raw_unique,
     )
     return payload
+
+
+def build_working_corpus(songlist: Dict[str, Any], deadnet_index: Dict[str, str]) -> Dict[str, Any]:
+    """Coalesce setlist-derived names onto the canonical dead.net catalog.
+
+    dead.net is the primary lyric source, so the working corpus is the dead_net
+    index (the canonical song set already fetched into state). Setlist variants
+    are coalesced onto canonical names by normalize_name (via NameIndex), with
+    setlist_mentions summed for priority ordering and the highest-played clean
+    variant supplying the display name. dead.net songs absent from the setlist
+    data keep a slug-derived name and sort to the tail (mentions == 0).
+    """
+    index = NameIndex(deadnet_index)
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for slug in deadnet_index.values():
+        display = " ".join(w.capitalize() for w in slug.split("-"))
+        buckets[slug] = {"name": display, "total": 0, "best": 0}
+    for s in songlist.get("songs") or []:
+        name = clean_song_name(s.get("name") or "")
+        mentions = int(s.get("setlist_mentions") or 0)
+        if not name:
+            continue
+        slug = index.get(name)
+        if not slug:
+            continue
+        b = buckets[slug]
+        b["total"] += mentions
+        if mentions and mentions > b["best"]:
+            b["best"] = mentions
+            b["name"] = name
+    cleaned = [
+        {"name": b["name"], "setlist_mentions": b["total"], "slug": slug}
+        for slug, b in buckets.items()
+    ]
+    cleaned.sort(key=lambda s: (-s["setlist_mentions"], s["name"].lower()))
+    return {"songs": cleaned, "unique_songs": len(cleaned),
+            "source": "dead.net canonical index"}
 
 
 # --------------------------------------------------------------------------
@@ -907,9 +952,17 @@ def cmd_run(limit: int, sources: List[str]) -> int:
     dn_index = NameIndex(state["indexes"].get("dead_net") or {})
     wg_index = NameIndex(state["indexes"].get("whitegum") or {})
 
+    # Working corpus: prefer the canonical dead.net catalog over setlist noise
+    # (names like '1. Ripple [7:52]' / 'd2t01 - Space' are not songs). Fall back
+    # to the setlist-derived list only if the dead.net index is unavailable.
+    dead_net = state["indexes"].get("dead_net") or {}
+    work_songs = songlist["songs"]
+    if dead_net:
+        work_songs = build_working_corpus(songlist, dead_net)["songs"]
+
     # ---- pick the next N unfinished songs (most-played first) ----
     selected: List[Dict[str, Any]] = []
-    for song in songlist["songs"]:
+    for song in work_songs:
         key = song["name"]
         done_srcs = set((state["done"].get(key) or {}).get("sources", {}))
         if done_srcs >= set(sources):
@@ -941,6 +994,7 @@ def cmd_run(limit: int, sources: List[str]) -> int:
                 hits = reddit_for_song(key, reddit_by_title)
                 if not hits:
                     misses["reddit"].append(key)
+                    done["sources"]["reddit"] = "no-match"
                     continue
                 merge_entry(entry, key, "reddit", {"interpretations": hits, "title": entry.get("title")},
                             hits[0]["url"])
@@ -948,9 +1002,12 @@ def cmd_run(limit: int, sources: List[str]) -> int:
                 fetched += 1
                 continue
             if src == "dead.net":
-                slug = dn_index.get(norm)
+                # Canonical corpus entries already know their dead.net slug;
+                # fall back to the fuzzy name lookup for raw-songlist runs.
+                slug = song.get("slug") or dn_index.get(norm)
                 if not slug:
                     misses["dead.net"].append(key)
+                    done["sources"]["dead.net"] = "no-match"
                     continue
                 url = f"{DEADNET_BASE}/song/{slug}"
                 doc = fetch(url, label=f"dead.net {slug}")
@@ -961,6 +1018,7 @@ def cmd_run(limit: int, sources: List[str]) -> int:
                 url = wg_index.get(norm)
                 if not url:
                     misses["whitegum"].append(key)
+                    done["sources"]["whitegum"] = "no-match"
                     continue
                 if "#" in url:
                     # Shared jam/instrumental page (JAMS.HTM#drums etc): the notes on
@@ -997,9 +1055,9 @@ def cmd_run(limit: int, sources: List[str]) -> int:
     run_info["finished_at"] = now_iso()
     state.setdefault("runs", []).append(run_info)
 
-    total = len(songlist["songs"])
-    in_dn = sum(1 for s in songlist["songs"] if dn_index.get(s["name"]) is not None)
-    in_wg = sum(1 for s in songlist["songs"] if wg_index.get(s["name"]) is not None)
+    total = len(work_songs)
+    in_dn = sum(1 for s in work_songs if s.get("slug") or dn_index.get(s["name"]) is not None)
+    in_wg = sum(1 for s in work_songs if wg_index.get(s["name"]) is not None)
     state["coverage"] = {
         "corpus_songs": total,
         "matched_dead_net": in_dn,

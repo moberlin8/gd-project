@@ -13,6 +13,7 @@ from urllib.parse import urljoin, urlparse
 import networkx as nx
 import csv
 import time
+import random
 import logging
 from collections import deque
 import argparse
@@ -32,6 +33,9 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Retry backoff delays (seconds); patched in tests to tiny values.
+BACKOFF_DELAYS = [1, 2, 4]
 
 class GDAOSiteCrawler:
     def __init__(self, start_url="https://www.gdao.org", max_depth=10, delay=1.0):
@@ -54,34 +58,58 @@ class GDAOSiteCrawler:
         return parsed.netloc == self.base_domain or parsed.netloc == ''
     
     def normalize_url(self, url):
-        """Normalize URL by removing fragments and query parameters"""
+        """Normalize URL for dedupe: drop the fragment and non-pagination query params.
+
+        Keeps only the 'page' query parameter (e.g. ?page=2) so paginated links
+        stay distinct nodes; other query params (tracking/sort/etc.) are stripped
+        so duplicate page variants still collapse for dedupe. This is the safer
+        minimal option vs keeping the entire query string.
+        """
         parsed = urlparse(url)
-        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        query = ''
+        if parsed.query:
+            kept = []
+            for pair in parsed.query.split('&'):
+                key, _, _ = pair.partition('=')
+                if key == 'page':
+                    kept.append(pair)
+            if kept:
+                query = '?' + '&'.join(kept)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}{query}"
     
     def get_links_from_page(self, url):
-        """Extract all internal links from a page"""
-        try:
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            links = []
-            
-            # Find all links
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                absolute_url = urljoin(url, href)
-                
-                if self.is_internal_link(absolute_url):
-                    normalized = self.normalize_url(absolute_url)
-                    if normalized not in self.visited:
-                        links.append(normalized)
-            
-            return links
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching {url}: {e}")
+        """Extract all internal links from a page; retries transient failures with backoff."""
+        response = None
+        for attempt in range(3):
+            try:
+                response = self.session.get(url, timeout=30)
+                response.raise_for_status()
+                break
+            except requests.exceptions.RequestException as e:
+                if attempt < 2:
+                    logger.warning(f"Error fetching {url}: {e}; retrying in {BACKOFF_DELAYS[attempt]:.1f}s")
+                    time.sleep(BACKOFF_DELAYS[attempt] + random.uniform(0, 0.5))
+                else:
+                    logger.error(f"Error fetching {url}: {e}")
+                    return []
+
+        if response is None:
             return []
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+        links = []
+        
+        # Find all links
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            absolute_url = urljoin(url, href)
+            
+            if self.is_internal_link(absolute_url):
+                normalized = self.normalize_url(absolute_url)
+                if normalized not in self.visited:
+                    links.append(normalized)
+        
+        return links
     
     def crawl(self):
         """Crawl the site using breadth-first search"""
@@ -121,9 +149,10 @@ class GDAOSiteCrawler:
         logger.info(f"Crawl complete. Visited {len(self.visited)} pages")
     
     def export_csv(self, filename):
-        """Export the graph as CSV (edges list)"""
+        """Export the graph as CSV (edges list); atomic write via tmp + os.replace"""
         csv_path = str(GDAO_TREE_DIR / filename)
-        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+        tmp_path = csv_path + '.tmp'
+        with open(tmp_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['source', 'target', 'source_depth', 'target_depth'])
             
@@ -131,13 +160,15 @@ class GDAOSiteCrawler:
                 source_depth = self.graph.nodes[source].get('depth', 0)
                 target_depth = self.graph.nodes[target].get('depth', 0)
                 writer.writerow([source, target, source_depth, target_depth])
+        os.replace(tmp_path, csv_path)
         
         logger.info(f"CSV exported to {csv_path}")
     
     def export_nodes_csv(self, filename):
-        """Export nodes as CSV"""
+        """Export nodes as CSV; atomic write via tmp + os.replace"""
         csv_path = str(GDAO_TREE_DIR / filename)
-        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+        tmp_path = csv_path + '.tmp'
+        with open(tmp_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['url', 'depth', 'in_degree', 'out_degree'])
             
@@ -146,11 +177,12 @@ class GDAOSiteCrawler:
                 in_degree = self.graph.in_degree(node)
                 out_degree = self.graph.out_degree(node)
                 writer.writerow([node, depth, in_degree, out_degree])
+        os.replace(tmp_path, csv_path)
         
         logger.info(f"Nodes CSV exported to {csv_path}")
     
     def export_dot(self, filename):
-        """Export the graph as DOT file for visualization"""
+        """Export the graph as DOT file for visualization; atomic write via tmp + os.replace"""
         dot_path = str(GDAO_TREE_DIR / filename)
         
         # Create DOT content
@@ -173,8 +205,10 @@ class GDAOSiteCrawler:
         
         dot_content.append("}")
         
-        with open(dot_path, 'w', encoding='utf-8') as dotfile:
+        tmp_path = dot_path + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as dotfile:
             dotfile.write('\n'.join(dot_content))
+        os.replace(tmp_path, dot_path)
         
         logger.info(f"DOT file exported to {dot_path}")
     
