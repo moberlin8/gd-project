@@ -21,4 +21,4 @@ if [ -z "${LEMIEUX_DISCORD_TOKEN:-}" ]; then
     exit 1
 fi
 
-exec python3 "$SCRIPT_DIR/lembot_discord.py" "$@"
+exec /usr/bin/python3 "$SCRIPT_DIR/lembot_discord.py" "$@"   # system 3.12 has faiss/discord.py
