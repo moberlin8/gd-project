@@ -1,10 +1,10 @@
 #!/bin/bash
-# Start Lemieux Telegram Bot
+# Start Lemieux GD Telegram Bot (auto-restart on crash)
 # Usage: ./start_lembot.sh
 #
 # Requires: LEMIEUX_TELEGRAM_TOKEN in environment or .env file
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -27,4 +27,26 @@ fi
 PY=/usr/bin/python3   # system 3.12 — where faiss/sentence-transformers/telegram live
 "$PY" -m pip install --break-system-packages --quiet python-telegram-bot 2>/dev/null || true
 
-exec "$PY" "$SCRIPT_DIR/lembot_telegram.py"
+LOG_FILE="$SCRIPT_DIR/logs/lembot_telegram.log"
+PID_FILE="$SCRIPT_DIR/lembot_telegram.pid"
+mkdir -p "$(dirname "$LOG_FILE")"
+
+# Auto-restart loop: kill old PID if stale, restart on exit
+while true; do
+  if [ -f "$PID_FILE" ]; then
+    OLD_PID=$(cat "$PID_FILE")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+      kill "$OLD_PID" 2>/dev/null
+      sleep 2
+    fi
+  fi
+
+  "$PY" "$SCRIPT_DIR/lembot_telegram.py" 2>>"$LOG_FILE" >>"$LOG_FILE" &
+  echo $! > "$PID_FILE"
+
+  # Block until the bot exits naturally — do NOT kill a healthy process on the next loop.
+  wait $! 2>/dev/null
+  EXIT_CODE=$?
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] Bot exited (code $EXIT_CODE), restarting in 5s…" >>"$LOG_FILE"
+  sleep 5  # Brief pause before restart to avoid spam
+done

@@ -39,6 +39,9 @@ Desktop.ini
 *.log
 *.log.*
 
+# PID files
+*.pid
+
 # Large data files (scraped data - keep locally, don't commit)
 data/*.json
 data/*.db
