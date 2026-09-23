@@ -206,6 +206,16 @@ class LemurTGBot:
 
         results = search(self.index, self.metadata, self.model, question, k=15)
 
+        # Augment general vector search with lyric/interpretation hits.
+        # The index is dominated by setlist_song entries (~31K of ~44K),
+        # so plain vector search for "Jack Straw lyrics" returns setlists
+        # and the LLM never sees the actual lyrics.  Folding in
+        # search_lyrics() results guarantees song-specific questions
+        # always reach the lyric vectors.
+        for r in search_lyrics(self.index, self.metadata, self.model, question, k=5):
+            if r["meta"] not in (h["meta"] for h in results):
+                results.append(r)
+
         if action == "ask":
             summary = summarize_with_llm(question, results, self.openai_key) if self.openai_key else None
             if summary:
