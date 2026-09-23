@@ -37,6 +37,10 @@ LLM_KEY_ENV = "XAI_API_KEY"
 LLM_MODEL = os.environ.get("LEMIEUX_LLM_MODEL", "grok-4.3")
 LLM_BASE_URL = os.environ.get("LEMIEUX_LLM_BASE_URL", "https://api.x.ai/v1")
 
+# Path to the Hermes-shared auth file whose access_token the runtime refreshes
+# ~hourly. Used as a live fallback key when XAI_API_KEY is missing/stale.
+NOUS_AUTH_PATH = Path("/home/hermes/.hermes/shared/nous_auth.json")
+
 BOT_NAME = "Lemieux"
 
 
@@ -213,33 +217,67 @@ SYSTEM_PROMPT = (
 )
 
 
+def _get_nous_token() -> Optional[str]:
+    """Return the live Nous access_token from the Hermes shared auth file.
+
+    The runtime refreshes this file ~hourly, so it stays valid even after the
+    token baked into .env (XAI_API_KEY) has expired. Returns None if the file
+    is missing or carries no access_token.
+    """
+    try:
+        with open(NOUS_AUTH_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        tok = data.get("access_token")
+        return tok if isinstance(tok, str) and tok else None
+    except (OSError, ValueError):
+        return None
+
+
 def summarize_with_llm(query: str, results: list[dict],
                        api_key: Optional[str] = None) -> Optional[str]:
-    """Synthesize an answer from retrieved hits. Returns None on any failure."""
-    api_key = api_key or os.environ.get(LLM_KEY_ENV)
-    if not api_key:
+    """Synthesize an answer from retrieved hits. Returns None on any failure.
+
+    Key resolution: explicit ``api_key`` > ``XAI_API_KEY`` env > Nous
+    ``nous_auth.json``. If the primary key is absent, uses the dynamized token
+    directly; if the primary key 401s, retries once with the dynamized token
+    (which the Hermes runtime refreshes ~hourly) so a stale .env token no
+    longer silently degrades to extractive-only answers.
+    """
+    primary = api_key or os.environ.get(LLM_KEY_ENV)
+    keys = [primary] if primary else []
+    auth_token = _get_nous_token()
+    if auth_token and auth_token not in keys:
+        keys.append(auth_token)
+    if not keys:
         return None
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key, base_url=LLM_BASE_URL)
-        user_msg = (
-            f'Question: "{query}"\n\n'
-            f"Retrieved sources ({len(results)}):\n\n{build_context(results)}"
-        )
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.3,
-            max_tokens=900,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[WARN] LLM synthesis failed ({LLM_MODEL} @ {LLM_BASE_URL}): {e}",
-              file=sys.stderr)
-        return None
+
+    for idx, key in enumerate(keys):
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=key, base_url=LLM_BASE_URL)
+            user_msg = (
+                f'Question: "{query}"\n\n'
+                f"Retrieved sources ({len(results)}):\n\n{build_context(results)}"
+            )
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.3,
+                max_tokens=900,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            # On 401 keep going to the next key (typically the live auth token);
+            # any other failure — or a 401 on the last key — ends the attempt.
+            if not (status == 401 and idx < len(keys) - 1):
+                print(f"[WARN] LLM synthesis failed ({LLM_MODEL} @ {LLM_BASE_URL}): {e}",
+                      file=sys.stderr)
+                return None
+    return None
 
 
 # ── Smoke test ────────────────────────────────────────────────────────────────
