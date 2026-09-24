@@ -175,8 +175,20 @@ class LemurTGBot:
         if not update.message or not update.message.text:
             return
         text = update.message.text
-        # Strip bot @mention prefix that appears when addressed in groups
         bot_username = context.bot.username
+        # In groups, only respond when the bot itself is @mentioned
+        if update.effective_chat.type in ("group", "supergroup"):
+            _mentioned = False
+            if bot_username and update.message.entities:
+                for ent in update.message.entities:
+                    if ent.type == "mention":
+                        span = text[ent.offset:ent.offset + ent.length]
+                        if span == f"@{bot_username}":
+                            _mentioned = True
+                            break
+            if not _mentioned:
+                return
+        # Strip bot @mention prefix that appears when addressed in groups
         if bot_username and text.startswith(f"@{bot_username}"):
             text = text[len(f"@{bot_username}"):]
         elif bot_username and f" @{bot_username}" in text:
@@ -261,7 +273,7 @@ class LemurTGBot:
             self.text_message))
         self.app.add_handler(MessageHandler(
             (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
-            & filters.TEXT & filters.Mention,
+            & filters.TEXT & filters.Entity("mention"),
             self.text_message))
         self.app.add_error_handler(self.on_error)
 
