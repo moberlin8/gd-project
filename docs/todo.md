@@ -49,6 +49,14 @@
 - [x] Verified: 1,127 chars analysis (musical detail, honest source gaps)
 - [x] Committed (2f51c9d)
 
+## ✅ Sep 24 — Add mention-based responses in groups
+- [x] Bot responds to @DLemieux_bot mentions in groups (not every message)
+- [x] Private chats still respond to all messages (unchanged)
+- [x] Strips @bot prefix before parsing query
+- [x] /gd command works everywhere
+- [x] Bot restarted (PID 136497), mention stripping verified
+- [x] Committed (ecdd19e)
+
 ## ✅ Sep 23 — Fix Lemieux not doing analysis
 ### Root Cause
 - Nous API token in .env expired after ~1 hour, but Hermes runtime auto-refreshes

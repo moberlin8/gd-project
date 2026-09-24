@@ -174,7 +174,15 @@ class LemurTGBot:
         """Bare text (no /gd) — treat as a question, or 'lyrics X' / 'meaning X' / 'search X'."""
         if not update.message or not update.message.text:
             return
-        action, question = self._parse_gd_args(update.message.text)
+        text = update.message.text
+        # Strip bot @mention prefix that appears when addressed in groups
+        bot_username = context.bot.username
+        if bot_username and text.startswith(f"@{bot_username}"):
+            text = text[len(f"@{bot_username}"):]
+        elif bot_username and f" @{bot_username}" in text:
+            text = text.replace(f" @{bot_username}", " ")
+        text = text.strip()
+        action, question = self._parse_gd_args(text)
         if question:
             await self._answer(update, context, action, question)
 
@@ -246,7 +254,15 @@ class LemurTGBot:
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("help", self.help))
         self.app.add_handler(CommandHandler("gd", self.gd_command))
-        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_message))
+        # Private chats: respond to all text messages.
+        # Groups/supergroups: respond only when the bot is @mentioned.
+        self.app.add_handler(MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            self.text_message))
+        self.app.add_handler(MessageHandler(
+            (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
+            & filters.TEXT & filters.Mention,
+            self.text_message))
         self.app.add_error_handler(self.on_error)
 
         print("🚀 Lemieux GD Telegram Bot starting...")
