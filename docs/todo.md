@@ -21,6 +21,18 @@
 - [x] Switched LLM from XAI/Grok to Nous inference API
 - [x] Killed HAL Discord bot crash loop
 
+## ✅ Sep 24 — Upgrade Lemieux LLM to deepseek/deepseek-v4-flash
+- [x] Switched LEMIEUX_LLM_MODEL from `poolside/laguna-s-2.1:free` to
+  `deepseek/deepseek-v4-flash` (same model Ada/subagents use on Nous API — FREE)
+- [x] Verified: produces deeper analysis (specific key changes, literary refs,
+  better structure) vs the old model's generic paraphrasing
+- [x] Bot restarted (PID 122074) with new model
+- [x] Tested: "Jack Straw dueling?" → rich literary analysis with Steinbeck ref
+- [x] Note: `deepseek/deepseek-v4-flash-0731` (in Hermes config) is broken —
+  returns empty responses; use `deepseek/deepseek-v4-flash` without suffix
+- [x] Updated .env.example with comment documenting the switch
+- [x] Committed (3929020)
+
 ## ✅ Sep 23 — Fix Lemieux not doing analysis
 ### Root Cause
 - Nous API token in .env expired after ~1 hour, but Hermes runtime auto-refreshes
