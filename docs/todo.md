@@ -31,7 +31,16 @@
 - [x] Note: `deepseek/deepseek-v4-flash-0731` (in Hermes config) is broken —
   returns empty responses; use `deepseek/deepseek-v4-flash` without suffix
 - [x] Updated .env.example with comment documenting the switch
-- [x] Committed (3929020)
+- [x] Committed (d8b40cb)
+
+## ✅ Sep 24 — Add model-level fallback for reliability
+- [x] Primary model: deepseek/deepseek-v4-flash (better analysis)
+- [x] Fallback model: poolside/laguna-s-2.1:free (if deepseek returns
+  empty output or times out — prevents silent degradation to extractive-only)
+- [x] Modified summarize_with_llm() to handle None content (no crash) +
+  retry with fallback model
+- [x] Bot restarted (PID 122894), LLM synthesis verified working
+- [x] Committed (28de55b)
 
 ## ✅ Sep 23 — Fix Lemieux not doing analysis
 ### Root Cause

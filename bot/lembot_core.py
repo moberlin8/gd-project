@@ -34,8 +34,9 @@ META_PATH = INDEX_DIR / "index_metadata.json"
 
 # ── LLM config ────────────────────────────────────────────────────────────────
 LLM_KEY_ENV = "XAI_API_KEY"
-LLM_MODEL = os.environ.get("LEMIEUX_LLM_MODEL", "grok-4.3")
-LLM_BASE_URL = os.environ.get("LEMIEUX_LLM_BASE_URL", "https://api.x.ai/v1")
+LLM_MODEL = os.environ.get("LEMIEUX_LLM_MODEL", "deepseek/deepseek-v4-flash")
+LLM_MODEL_FALLBACK = os.environ.get("LEMIEUX_LLM_MODEL_FALLBACK", "poolside/laguna-s-2.1:free")
+LLM_BASE_URL = os.environ.get("LEMIEUX_LLM_BASE_URL", "https://inference-api.nousresearch.com/v1")
 
 # Path to the Hermes-shared auth file whose access_token the runtime refreshes
 # ~hourly. Used as a live fallback key when XAI_API_KEY is missing/stale.
@@ -242,41 +243,57 @@ def summarize_with_llm(query: str, results: list[dict],
     directly; if the primary key 401s, retries once with the dynamized token
     (which the Hermes runtime refreshes ~hourly) so a stale .env token no
     longer silently degrades to extractive-only answers.
-    """
-    primary = api_key or os.environ.get(LLM_KEY_ENV)
-    keys = [primary] if primary else []
-    auth_token = _get_nous_token()
-    if auth_token and auth_token not in keys:
-        keys.append(auth_token)
-    if not keys:
-        return None
 
-    for idx, key in enumerate(keys):
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=key, base_url=LLM_BASE_URL)
-            user_msg = (
-                f'Question: "{query}"\n\n'
-                f"Retrieved sources ({len(results)}):\n\n{build_context(results)}"
-            )
-            resp = client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ],
-                temperature=0.3,
-                max_tokens=900,
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            status = getattr(e, "status_code", None)
-            # On 401 keep going to the next key (typically the live auth token);
-            # any other failure — or a 401 on the last key — ends the attempt.
-            if not (status == 401 and idx < len(keys) - 1):
-                print(f"[WARN] LLM synthesis failed ({LLM_MODEL} @ {LLM_BASE_URL}): {e}",
-                      file=sys.stderr)
-                return None
+    Model fallback: if the primary model (``LEMIEUX_LLM_MODEL``) returns no
+    usable output, retries with ``LEMIEUX_LLM_MODEL_FALLBACK`` (default:
+    poolside/laguna-s-2.1:free) so a flaky free tier never silently drops
+    analysis.
+    """
+    auth_token = _get_nous_token()
+    models = [LLM_MODEL]
+    if LLM_MODEL_FALLBACK and LLM_MODEL_FALLBACK not in models:
+        models.append(LLM_MODEL_FALLBACK)
+
+    for model in models:
+        primary = api_key or os.environ.get(LLM_KEY_ENV)
+        keys = [primary] if primary else []
+        if auth_token and auth_token not in keys:
+            keys.append(auth_token)
+        if not keys:
+            continue
+
+        for idx, key in enumerate(keys):
+            try:
+                from openai import OpenAI
+                client = OpenAI(api_key=key, base_url=LLM_BASE_URL, timeout=30)
+                user_msg = (
+                    f'Question: "{query}"\n\n'
+                    f"Retrieved sources ({len(results)}):\n\n{build_context(results)}"
+                )
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    temperature=0.3,
+                    max_tokens=900,
+                )
+                content = resp.choices[0].message.content
+                if content and content.strip():
+                    return content.strip()
+                # Empty content — try next key, then fallback model
+            except Exception as e:
+                status = getattr(e, "status_code", None)
+                # On 401 keep going to the next key;
+                # any other failure ends this model attempt.
+                if not (status == 401 and idx < len(keys) - 1):
+                    break
+
+        if model != models[-1]:
+            print(f"[INFO] {model} produced no usable output; "
+                  f"retrying with {models[-1]}", file=sys.stderr)
+
     return None
 
 
