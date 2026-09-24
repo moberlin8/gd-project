@@ -42,6 +42,13 @@
 - [x] Bot restarted (PID 122894), LLM synthesis verified working
 - [x] Committed (28de55b)
 
+## ✅ Sep 24 — Switch to LongCat 2.0 (better free model)
+- [x] Primary model: meituan/longcat-2.0:free (truly $0 cost, deeper GD analysis)
+- [x] Fallback model: deepseek/deepseek-v4-flash (effectively free, proven)
+- [x] Bot restarted (PID 123726) with LongCat primary
+- [x] Verified: 1,127 chars analysis (musical detail, honest source gaps)
+- [x] Committed (2f51c9d)
+
 ## ✅ Sep 23 — Fix Lemieux not doing analysis
 ### Root Cause
 - Nous API token in .env expired after ~1 hour, but Hermes runtime auto-refreshes
