@@ -175,20 +175,8 @@ class LemurTGBot:
         if not update.message or not update.message.text:
             return
         text = update.message.text
-        bot_username = context.bot.username
-        # In groups, only respond when the bot itself is @mentioned
-        if update.effective_chat.type in ("group", "supergroup"):
-            _mentioned = False
-            if bot_username and update.message.entities:
-                for ent in update.message.entities:
-                    if ent.type == "mention":
-                        span = text[ent.offset:ent.offset + ent.length]
-                        if span == f"@{bot_username}":
-                            _mentioned = True
-                            break
-            if not _mentioned:
-                return
         # Strip bot @mention prefix that appears when addressed in groups
+        bot_username = context.bot.username
         if bot_username and text.startswith(f"@{bot_username}"):
             text = text[len(f"@{bot_username}"):]
         elif bot_username and f" @{bot_username}" in text:
@@ -266,14 +254,10 @@ class LemurTGBot:
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("help", self.help))
         self.app.add_handler(CommandHandler("gd", self.gd_command))
-        # Private chats: respond to all text messages.
-        # Groups/supergroups: respond only when the bot is @mentioned.
+        # Respond to ALL text messages (private + group). Mention-stripping
+        # in the handler cleans up @botname prefixes when addressed in groups.
         self.app.add_handler(MessageHandler(
-            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-            self.text_message))
-        self.app.add_handler(MessageHandler(
-            (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
-            & filters.TEXT & filters.Entity("mention"),
+            filters.TEXT & ~filters.COMMAND,
             self.text_message))
         self.app.add_error_handler(self.on_error)
 
