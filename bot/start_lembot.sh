@@ -16,6 +16,17 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     export $(grep -v '^#' "$SCRIPT_DIR/.env" | xargs)
 fi
 
+# Auto-refresh Nous bearer token from Hermes auth file (JWT expires hourly;
+# a stale .env XAI_API_KEY causes silent 401s and the bot falls back to
+# extractive-only results with no user-visible error)
+NOUS_AUTH="/home/hermes/.hermes/shared/nous_auth.json"
+if [ -f "$NOUS_AUTH" ]; then
+    NOUS_TOKEN=$(python3 -c "import json; print(json.load(open('$NOUS_AUTH')).get('access_token',''))" 2>/dev/null)
+    if [ -n "$NOUS_TOKEN" ]; then
+        export XAI_API_KEY="$NOUS_TOKEN"
+    fi
+fi
+
 if [ -z "${LEMIEUX_TELEGRAM_TOKEN:-}" ]; then
     echo "❌ LEMIEUX_TELEGRAM_TOKEN not set."
     echo "   1. Talk to @BotFather on Telegram"

@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -34,8 +35,8 @@ META_PATH = INDEX_DIR / "index_metadata.json"
 
 # ── LLM config ────────────────────────────────────────────────────────────────
 LLM_KEY_ENV = "XAI_API_KEY"
-LLM_MODEL = os.environ.get("LEMIEUX_LLM_MODEL", "deepseek/deepseek-v4-flash")
-LLM_MODEL_FALLBACK = os.environ.get("LEMIEUX_LLM_MODEL_FALLBACK", "poolside/laguna-s-2.1:free")
+LLM_MODEL = os.environ.get("LEMIEUX_LLM_MODEL", "poolside/laguna-s-2.1:free")
+LLM_MODEL_FALLBACK = os.environ.get("LEMIEUX_LLM_MODEL_FALLBACK", "qwen/qwen3.8-omni-flash")
 LLM_BASE_URL = os.environ.get("LEMIEUX_LLM_BASE_URL", "https://inference-api.nousresearch.com/v1")
 
 # Path to the Hermes-shared auth file whose access_token the runtime refreshes
@@ -70,7 +71,14 @@ def load_rat():
 
 # ── Search ────────────────────────────────────────────────────────────────────
 def search(index, metadata, model, query: str, k: int = 10):
-    """Vector search over the whole index."""
+    """Vector search over the whole index.
+
+    When ``query`` carries a recognizable date (e.g. 'September 25',
+    '9/25', '1974-09-25', 'today'), the results are augmented with
+    metadata entries whose show date matches — the vector text for
+    setlist entries doesn't include the date, so date questions would
+    otherwise miss them entirely.
+    """
     q_vec = model.encode([query], convert_to_numpy=True)
     distances, indices = index.search(q_vec, k)
     results = []
@@ -78,7 +86,229 @@ def search(index, metadata, model, query: str, k: int = 10):
         if idx < 0 or idx >= len(metadata):
             continue
         results.append({"score": float(dist), "meta": metadata[idx]})
+    _augment_with_date_results(metadata, query, results)
     return results
+
+
+# ── Date-aware search ─────────────────────────────────────────────────────────
+_MONTHS = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6,
+    "july": 7, "jul": 7, "august": 8, "aug": 8, "september": 9, "sep": 9,
+    "sept": 9, "october": 10, "oct": 10, "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+# Word-form numbers → integer day (1–31). Covers the full range a calendar
+# day can take, including compound forms like "twenty-fifth" / "twenty five".
+_WORD_NUMS = {
+    "one": 1, "first": 1, "two": 2, "second": 2, "three": 3, "third": 3,
+    "four": 4, "fourth": 4, "five": 5, "fifth": 5, "six": 6, "sixth": 6,
+    "seven": 7, "seventh": 7, "eight": 8, "eighth": 8, "nine": 9, "ninth": 9,
+    "ten": 10, "tenth": 10, "eleven": 11, "eleventh": 11, "twelve": 12,
+    "twelfth": 12, "thirteen": 13, "thirteenth": 13, "fourteen": 14,
+    "fourteenth": 14, "fifteen": 15, "fifteenth": 15, "sixteen": 16,
+    "sixteenth": 16, "seventeen": 17, "seventeenth": 17, "eighteen": 18,
+    "eighteenth": 18, "nineteen": 19, "nineteenth": 19, "twenty": 20,
+    "twentieth": 20, "thirty": 30, "thirtieth": 30, "thirty-one": 31,
+    "thirty-first": 31,
+}
+
+
+def _word_to_int(s: str) -> Optional[int]:
+    """Convert a word-form number (e.g. 'twenty-fifth', 'twenty five') to int.
+
+    Handles 1–31 including compound tens+ones. Returns None if not a number.
+    """
+    s = s.strip().lower().replace("-", " ")
+    parts = [p for p in s.split() if p]
+    if not parts:
+        return None
+    # Single word
+    if len(parts) == 1:
+        return _WORD_NUMS.get(parts[0])
+    # Compound "twenty five" / "twenty fifth" → tens + ones
+    tens = _WORD_NUMS.get(parts[0])
+    if tens is None or tens < 20:
+        return None
+    ones = _WORD_NUMS.get(parts[1])
+    if ones is None or ones > 9:
+        return None
+    return tens + ones
+
+
+def _parse_date_query(query) -> Optional[dict]:
+    """Extract date information from a user query.
+
+    Returns a dict with ``month``/``day`` (and ``year`` when present), or
+    ``None`` if no usable date is found. Recognizes:
+
+      - 'September 25' / 'Sep 25' / 'September 25, 1974'  → month, day [, year]
+      - 'September twenty-fifth' / 'Sep twenty five'      → word-form day
+      - '9/25' or '09/25'                                  → month=9, day=25
+      - '9-25' or '09-25'                                  → month=9, day=25 (dash date)
+      - '1974-09-25' or 'gd1974-09-25'                     → year, month, day
+      - 'today'                                            → current month/day/year
+    """
+    if not query or not isinstance(query, str):
+        return None
+    low = query.lower()
+    now = datetime.now()
+
+    # 'today' → current date
+    if re.search(r"\btoday\b", low):
+        return {"month": now.month, "day": now.day, "year": now.year}
+
+    # 'YYYY-MM-DD' (optionally inside a gdYYYY-MM-DD show identifier)
+    m = re.search(r"(?:gd)?(\d{4})-(\d{1,2})-(\d{1,2})", query)
+    if m:
+        return {
+            "year": int(m.group(1)),
+            "month": int(m.group(2)),
+            "day": int(m.group(3)),
+        }
+
+    # Numeric 'M/D'
+    m = re.search(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?![\d/])", query)
+    if m:
+        mo, d = int(m.group(1)), int(m.group(2))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return {"month": mo, "day": d}
+
+    # Ambiguous dash date 'M-D' (e.g. '9-25' / '09-25'). Same month/day
+    # convention as 'M/D'. The full 'YYYY-MM-DD' form is handled above, so
+    # this only fires for short dash dates.
+    m = re.search(r"(?<![\d-])(\d{1,2})-(\d{1,2})(?![\d-])", query)
+    if m:
+        mo, d = int(m.group(1)), int(m.group(2))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return {"month": mo, "day": d}
+
+    # Month name + day (+ optional year), numeric day
+    m = re.search(
+        r"\b([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{4}))?\b", low
+    )
+    if m:
+        month = _MONTHS.get(m.group(1))
+        if month is None:
+            prefix = m.group(1)[:3]
+            for name, num in _MONTHS.items():
+                if name.startswith(prefix):
+                    month = num
+                    break
+        day = int(m.group(2))
+        if month and 1 <= day <= 31:
+            info = {"month": month, "day": day}
+            if m.group(3):
+                info["year"] = int(m.group(3))
+            return info
+
+    # Month name + word-form day (e.g. 'September twenty-fifth',
+    # 'Sep twenty five'). Optional year follows the day.
+    # Use an explicit alternation of known month names so that preceding
+    # words like "shows" or "about" don't get greedy-matched as the month.
+    _mon_alt = "|".join(sorted(_MONTHS, key=len, reverse=True))
+    m = re.search(
+        rf"\b({_mon_alt})\s+([a-z]+(?:[\s-][a-z]+)?)(?:\s*,?\s*(\d{{4}}))?\b",
+        low,
+    )
+    if m:
+        month = _MONTHS.get(m.group(1))
+        if month is None:
+            prefix = m.group(1)[:3]
+            for name, num in _MONTHS.items():
+                if name.startswith(prefix):
+                    month = num
+                    break
+        day = _word_to_int(m.group(2))
+        if month and day and 1 <= day <= 31:
+            info = {"month": month, "day": day}
+            if m.group(3):
+                info["year"] = int(m.group(3))
+            return info
+    return None
+
+
+def _resolve_today(query: str) -> str:
+    """Replace standalone 'today' in a query with the current date text.
+
+    e.g. 'What shows today' → 'What shows September 25, 2026'
+    """
+    if not query or not re.search(r"\btoday\b", query, flags=re.IGNORECASE):
+        return query
+    return re.sub(
+        r"\btoday\b", datetime.now().strftime("%B %d, %Y"), query, flags=re.IGNORECASE
+    )
+
+
+def _metadata_show_date(m) -> Optional[tuple]:
+    """Return (year, month, day) of the show a metadata entry belongs to.
+
+    Reads the date from ``show_identifier`` (gdYYYY-MM-DD...) and falls back
+    to the 'created' field for ``setlist_song`` entries, which store the show
+    date there (YYYY-MM-DD). Returns None when no date can be determined.
+    """
+    sid = m.get("show_identifier") or ""
+    g = re.search(r"(?:gd)?(\d{2,4})-(\d{2})-(\d{2})", sid)
+    if g:
+        y = int(g.group(1))
+        if y < 100:
+            y = 1900 + y if y > 30 else 2000 + y
+        return y, int(g.group(2)), int(g.group(3))
+    if m.get("type") == "setlist_song":
+        created = m.get("created") or ""
+        g2 = re.search(r"^(\d{4})-(\d{2})-(\d{2})", created)
+        if g2:
+            return int(g2.group(1)), int(g2.group(2)), int(g2.group(3))
+    return None
+
+
+def _date_matches(mo: int, d: int, y: int, month: int, day: int, year) -> bool:
+    """Match a show date against a parsed date query.
+
+    With a year → exact match. Without a year → cross-year month/day match
+    (all shows ever played on that calendar date).
+    """
+    if year is not None:
+        return y == year and mo == month and d == day
+    return mo == month and d == day
+
+
+def _filter_metadata_by_date(metadata, date_info) -> list:
+    """Return metadata entries whose show date matches ``date_info``.
+
+    ``date_info`` is the dict from ``_parse_date_query``. Matching is by
+    show date (month+day across years, or full year+month+day when a year
+    is given). Order of the input list is preserved.
+    """
+    if not date_info or not isinstance(metadata, list):
+        return []
+    month = date_info.get("month")
+    day = date_info.get("day")
+    year = date_info.get("year")
+    if not month or not day:
+        return []
+    out = []
+    for m in metadata:
+        d = _metadata_show_date(m)
+        if d and _date_matches(d[1], d[2], d[0], month, day, year):
+            out.append(m)
+    return out
+
+
+def _augment_with_date_results(metadata, query, results) -> None:
+    """Merge date-filtered metadata entries into ``results`` (in place).
+
+    Called when a query contains a date, so shows on that date surface even
+    though the setlist vector text omits the date. Deduplicated by
+    show_identifier+type (via full dict equality on the meta).
+    """
+    date_info = _parse_date_query(query)
+    if not date_info:
+        return
+    for m in _filter_metadata_by_date(metadata, date_info):
+        if not any(r["meta"] == m for r in results):
+            results.append({"score": 1.0, "meta": m})
 
 
 def _norm_name(s: str) -> str:
@@ -235,8 +465,18 @@ def _get_nous_token() -> Optional[str]:
 
 
 def summarize_with_llm(query: str, results: list[dict],
-                       api_key: Optional[str] = None) -> Optional[str]:
+                       api_key: Optional[str] = None,
+                       metadata: Optional[list] = None) -> Optional[str]:
     """Synthesize an answer from retrieved hits. Returns None on any failure.
+
+    * The current date is always injected into the system prompt so the model
+      knows what 'today' means.
+    * A standalone 'today' in ``query`` is expanded to the literal calendar
+      date so vector retrieval treats it as a real date.
+    * When ``metadata`` (the full index metadata) is supplied and the query
+      contains a date, shows on that date are filtered by metadata and merged
+      into ``results`` — covering date queries even when the caller didn't
+      run them through :func:`search`.
 
     Key resolution: explicit ``api_key`` > ``XAI_API_KEY`` env > Nous
     ``nous_auth.json``. If the primary key is absent, uses the dynamized token
@@ -249,6 +489,14 @@ def summarize_with_llm(query: str, results: list[dict],
     poolside/laguna-s-2.1:free) so a flaky free tier never silently drops
     analysis.
     """
+    today = datetime.now().strftime("%B %d, %Y")
+    system_prompt = SYSTEM_PROMPT + f"\n\nToday is {today}."
+    query = _resolve_today(query)
+
+    # Date-aware merge: surface shows on the queried date.
+    if isinstance(metadata, list):
+        _augment_with_date_results(metadata, query, results)
+
     auth_token = _get_nous_token()
     models = [LLM_MODEL]
     if LLM_MODEL_FALLBACK and LLM_MODEL_FALLBACK not in models:
@@ -273,7 +521,7 @@ def summarize_with_llm(query: str, results: list[dict],
                 resp = client.chat.completions.create(
                     model=model,
                     messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_msg},
                     ],
                     temperature=0.3,
